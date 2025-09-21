@@ -1,0 +1,16 @@
+{
+  "name": "amazon-ynab-sync",
+  "version": "1.0.0",
+  "description": "Playwright script for Amazon login and data extraction",
+  "main": "login.ts",
+  "scripts": {
+    "login": "npx ts-node login.ts"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.0",
+    "@types/node": "^20.0.0"
+  }
+}
