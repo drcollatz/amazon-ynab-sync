@@ -1,0 +1,550 @@
+/* Global Styles */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #f5f5f5;
+  color: #333;
+  line-height: 1.6;
+}
+
+.app {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+header {
+  text-align: center;
+  margin-bottom: 30px;
+  padding: 30px;
+  background: linear-gradient(135deg, #ff9900, #ff6600);
+  color: white;
+  border-radius: 0;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+header h1 {
+  font-size: 2.5rem;
+  font-weight: 300;
+  margin: 0;
+}
+
+main {
+  display: flex;
+  flex-direction: column;
+  gap: 30px;
+  width: 100%;
+  padding: 0 0 40px;
+}
+
+/* Config Section */
+.config-section {
+  background: white;
+  padding: 25px;
+  border-radius: 0;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  width: 100%;
+}
+
+.config-section h2 {
+  color: #333;
+  margin-bottom: 20px;
+  font-size: 1.5rem;
+}
+
+.config-item {
+  margin-bottom: 25px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid #eee;
+}
+
+.config-item:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+}
+
+.config-item h3 {
+  color: #555;
+  margin-bottom: 10px;
+  font-size: 1.1rem;
+}
+
+.status-display {
+  margin-bottom: 15px;
+  font-weight: 500;
+}
+
+.status-valid {
+  color: #28a745;
+}
+
+.status-invalid {
+  color: #dc3545;
+}
+
+.button-group {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.timeframe-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 15px;
+  align-items: center;
+  margin: 15px 0;
+}
+
+.timeframe-controls label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+
+.timeframe-controls input[type='number'] {
+  width: 80px;
+  padding: 4px 6px;
+}
+
+.date-range-inputs {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.date-range-inputs label {
+  display: flex;
+  flex-direction: column;
+  font-weight: 500;
+  gap: 4px;
+}
+
+.date-range-inputs input[type='date'] {
+  padding: 4px 6px;
+}
+
+.form-error {
+  margin-top: 10px;
+  color: #dc3545;
+  font-weight: 600;
+}
+
+/* Transaction List */
+.transaction-list {
+  background: white;
+  padding: 25px;
+  border-radius: 0;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  width: 100%;
+}
+
+.list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.list-header h2 {
+  color: #333;
+  font-size: 1.5rem;
+  margin: 0;
+}
+
+.bulk-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  padding: 15px;
+  background: #f8f9fa;
+  border-radius: 8px;
+  border: 1px solid #dee2e6;
+}
+
+.bulk-actions label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.transactions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.transaction-item {
+  display: flex;
+  align-items: flex-start;
+  padding: 15px;
+  border: 1px solid #dee2e6;
+  border-radius: 8px;
+  background: white;
+  transition: all 0.2s ease;
+}
+
+.transaction-item:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  border-color: #ff9900;
+}
+
+.transaction-item.synced {
+  background: #f8fff8;
+  border-color: #28a745;
+}
+
+.transaction-checkbox {
+  margin-right: 15px;
+  margin-top: 2px;
+}
+
+.transaction-content {
+  flex: 1;
+}
+
+.transaction-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.date {
+  font-weight: 500;
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.amount {
+  font-weight: bold;
+  font-size: 1.1rem;
+  color: #dc3545;
+}
+
+.amount.refund {
+  color: #28a745;
+}
+
+.transaction-details {
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.merchant {
+  font-weight: 600;
+  color: #333;
+}
+
+.description {
+  color: #555;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.description-list {
+  margin: 6px 0 0 18px;
+  color: #444;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.description-list li {
+  list-style: decimal;
+  margin-left: 0;
+  line-height: 1.4;
+}
+
+.description-list .item-title {
+  font-weight: 500;
+}
+
+.description-list .item-price {
+  margin-left: 6px;
+  color: #6c757d;
+  font-size: 0.9rem;
+}
+
+.description-list .item-more {
+  list-style: none;
+  font-style: italic;
+  color: #6c757d;
+}
+
+.sync-status-info {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid #dee2e6;
+  background: #f8f9fa;
+  color: #343a40;
+  max-width: 480px;
+  font-size: 0.9rem;
+}
+
+.sync-status-info.status-running {
+  border-color: #ffc107;
+  background: #fff8e1;
+}
+
+.sync-status-info.status-success {
+  border-color: #28a745;
+  background: #f0fff4;
+}
+
+.sync-status-info.status-error {
+  border-color: #dc3545;
+  background: #fff5f5;
+  color: #721c24;
+}
+
+.sync-status-label {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.sync-status-logs {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sync-status-logs li {
+  line-height: 1.3;
+}
+
+.sync-status-error {
+  margin-bottom: 6px;
+}
+
+.sync-status-single {
+  line-height: 1.3;
+}
+
+.btn-icon {
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 1.1rem;
+  padding: 2px 6px;
+  line-height: 1;
+}
+
+.transaction-meta .btn-icon:first-of-type {
+  margin-left: auto;
+}
+
+.transaction-meta .btn-icon + .btn-icon {
+  margin-left: 4px;
+}
+
+.btn-icon:disabled {
+  cursor: progress;
+  opacity: 0.5;
+}
+
+.btn-icon.danger {
+  color: #dc3545;
+}
+
+.btn-icon.danger:hover {
+  color: #a71d2a;
+}
+
+.btn-icon.danger:disabled {
+  color: #dc3545;
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.ai-summary {
+  margin-top: 8px;
+  font-size: 0.9rem;
+  color: #333;
+}
+
+.ai-summary.error {
+  color: #dc3545;
+}
+
+.ai-summary .model-tag {
+  margin-left: 8px;
+  font-size: 0.75rem;
+  color: #6c757d;
+  text-transform: uppercase;
+}
+
+.btn-danger {
+  background: #dc3545;
+  color: #fff;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.btn-danger:hover {
+  background: #c82333;
+}
+
+.btn-danger:disabled {
+  background: #e4606d;
+  cursor: not-allowed;
+}
+
+.transaction-meta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.order-id {
+  font-size: 0.8rem;
+  color: #666;
+  background: #f8f9fa;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.sync-status {
+  font-size: 0.8rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.sync-status.synced {
+  background: #d4edda;
+  color: #155724;
+}
+
+.refund-badge {
+  background: #d1ecf1;
+  color: #0c5460;
+  font-size: 0.8rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* Buttons */
+.btn-primary {
+  background: linear-gradient(135deg, #ff9900, #ff6600);
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s ease;
+  text-decoration: none;
+  display: inline-block;
+}
+
+.btn-primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(255, 153, 0, 0.3);
+}
+
+.btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-secondary {
+  background: #6c757d;
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s ease;
+  text-decoration: none;
+  display: inline-block;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: #5a6268;
+  transform: translateY(-1px);
+}
+
+.btn-secondary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .app {
+    padding: 10px;
+  }
+
+  header h1 {
+    font-size: 2rem;
+  }
+
+  .config-section,
+  .transaction-list {
+    padding: 15px;
+  }
+
+  .list-header {
+    flex-direction: column;
+    gap: 10px;
+    align-items: stretch;
+  }
+
+  .bulk-actions {
+    flex-direction: column;
+    gap: 10px;
+    align-items: stretch;
+  }
+
+  .button-group {
+    flex-direction: column;
+  }
+
+  .transaction-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 5px;
+  }
+
+  .transaction-meta {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 5px;
+  }
+}
+
+@media (max-width: 480px) {
+  .transaction-item {
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .transaction-checkbox {
+    margin-right: 0;
+    align-self: flex-start;
+  }
+}

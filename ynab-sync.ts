@@ -93,6 +93,7 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<any>
       orderId?: string | null;
       orderUrl?: string | null;
       orderDescription?: string | null;
+      aiSummary?: string | null;
       ynabSynced?: boolean;
       ynabSync?: any;
     }>;
@@ -105,16 +106,25 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<any>
       return { ...t, __index: idx, isoDate: iso };
     })
     .filter(t => !!t.isoDate && inCurrentMonth(t.isoDate!))
-    .filter(t => !t.ynabSynced);
+    .filter(t => {
+      if (!t.ynabSynced) return true;
+      const ynabInfo = t.ynabSync as { ynabTransactionId?: string | null } | undefined;
+      return !ynabInfo?.ynabTransactionId;
+    });
 
   // 2) Mapping ins YNAB-Format
   const ynabTx = candidates.map((t) => {
     const amountMilli = amountToMilliunits(t.amount, !!t.isRefund);
     const payee_name = t.merchant || "Amazon";
-    const memo = t.orderDescription ? t.orderDescription.slice(0, 200) : ""; // YNAB mag knappe Memos
 
     // import_id hilft Duplikate zu vermeiden (max. 36 Zeichen, oft Muster: "API:amount:isoDate:counter")
-    const import_id = `AMZ:${amountMilli}:${t.isoDate}`;
+    // Bei Retries (wenn ynabTransactionId null ist) neuen import_id verwenden, um gelöschte Transaktionen neu anzulegen
+    const import_id = t.ynabSync && !t.ynabSync.ynabTransactionId
+      ? `AMZ:${amountMilli}:${t.isoDate}:r${Date.now().toString().slice(-6)}`
+      : `AMZ:${amountMilli}:${t.isoDate}`;
+
+    // Use AI summary as memo, fallback to order description (YNAB prefers concise memos)
+    const memo = t.aiSummary || (t.orderDescription ? t.orderDescription.slice(0, 200) : "");
 
     return {
       account_id: YNAB_ACCOUNT_ID,
