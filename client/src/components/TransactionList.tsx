@@ -1,10 +1,275 @@
 import { useState } from 'react';
 import type { Transaction } from '../App';
 
+const euroFormatter = new Intl.NumberFormat('de-DE', {
+  style: 'currency',
+  currency: 'EUR'
+});
+
 interface TransactionListProps {
   transactions: Transaction[];
   loading: boolean;
   onRefresh: () => void;
+}
+
+type SelectionStatusValue =
+  | 'queued'
+  | 'synced'
+  | 'already-synced'
+  | 'invalid-date'
+  | 'not-found';
+
+interface FilterSummary {
+  count: number;
+  examples: string[];
+}
+
+interface SyncSelectionStatusEntry {
+  status: SelectionStatusValue;
+  detail?: string;
+}
+
+interface SyncSummarySelection {
+  provided: number;
+  queuedIds: string[];
+  syncedIds: string[];
+  alreadySynced: string[];
+  invalidDate: string[];
+  missingIds: string[];
+  statuses: Record<string, SyncSelectionStatusEntry>;
+}
+
+interface SyncSummary {
+  timestamp: string;
+  dryRun: boolean;
+  totals?: {
+    fileTransactions?: number;
+    withOrderId?: number;
+    withValidDate?: number;
+    eligibleBeforeSelection?: number;
+  };
+  filters?: {
+    invalidDate?: FilterSummary;
+    alreadySynced?: FilterSummary;
+  };
+  flags?: {
+    ynabSyncedWithoutId?: FilterSummary;
+  };
+  candidates?: {
+    count: number;
+    refunds: number;
+    totalAmountMilliunits: number;
+  };
+  response?: {
+    requested: number;
+    created: number;
+    duplicateImportIds: string[];
+    missingImportIds: string[];
+    matchedImportIds: number;
+    error?: string;
+  };
+  selection?: SyncSummarySelection;
+}
+
+interface SyncResult {
+  success: boolean;
+  message: string;
+  summary?: SyncSummary | null;
+  output?: string | null;
+  stderr?: string | null;
+}
+
+interface SyncResultModalProps {
+  result: SyncResult;
+  onClose: () => void;
+}
+
+function formatCurrencyFromMilliunits(value?: number | null): string | null {
+  if (typeof value !== 'number' || Number.isNaN(value)) return null;
+  return euroFormatter.format(value / 1000);
+}
+
+function SyncResultModal({ result, onClose }: SyncResultModalProps) {
+  const { success, message, summary, output, stderr } = result;
+  const selection = summary?.selection;
+  const statuses = selection?.statuses ?? {};
+  const queuedIds = selection?.queuedIds ?? [];
+  const queuedMissing = queuedIds.filter((id) => statuses[id]?.detail === 'missing-ynab-transaction-id');
+  const queuedOthers = queuedIds.filter((id) => statuses[id]?.detail !== 'missing-ynab-transaction-id');
+  const missingIds = selection?.missingIds ?? [];
+  const duplicateImportIds = summary?.response?.duplicateImportIds ?? [];
+  const missingImportIds = summary?.response?.missingImportIds ?? [];
+  const responseError = summary?.response?.error;
+  const totalAmount = formatCurrencyFromMilliunits(summary?.candidates?.totalAmountMilliunits ?? null);
+  const timestamp = summary?.timestamp ? new Date(summary.timestamp).toLocaleString('de-DE') : null;
+  const filterEntries = [
+    { label: 'Ungültiges Datum', data: summary?.filters?.invalidDate },
+    { label: 'Bereits synchronisiert', data: summary?.filters?.alreadySynced },
+    { label: 'Als synchron markiert (ohne YNAB-ID)', data: summary?.flags?.ynabSyncedWithoutId }
+  ].filter((entry) => entry.data && entry.data.count > 0);
+  const showOutput = Boolean(output && output.trim().length > 0);
+  const showStderr = Boolean(stderr && stderr.trim().length > 0);
+  const response = summary?.response;
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onClose}>
+      <div
+        className={`modal ${success ? 'modal-success' : 'modal-error'}`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="modal-header">
+          <h3>{success ? 'YNAB Sync erfolgreich' : 'YNAB Sync fehlgeschlagen'}</h3>
+          <button type="button" className="modal-close" onClick={onClose} aria-label="Schließen">
+            ×
+          </button>
+        </div>
+        <div className="modal-body">
+          <p className="modal-message">{message}</p>
+          {timestamp && <p className="modal-timestamp">Zeitpunkt: {timestamp}</p>}
+
+          {summary && (
+            <div className="summary-section">
+              <div className="summary-grid">
+                <div>
+                  <span className="summary-label">Kandidaten</span>
+                  <span className="summary-value">{summary.candidates?.count ?? 0}</span>
+                </div>
+                <div>
+                  <span className="summary-label">Übermittelt</span>
+                  <span className="summary-value">{response?.requested ?? 0}</span>
+                </div>
+                <div>
+                  <span className="summary-label">Import-IDs bestätigt</span>
+                  <span className="summary-value">{response?.matchedImportIds ?? 0}</span>
+                </div>
+                <div>
+                  <span className="summary-label">Gesamtbetrag</span>
+                  <span className="summary-value">{totalAmount ?? '–'}</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {selection && (
+            <div className="summary-section">
+              <h4>Auswahl</h4>
+              <ul>
+                <li>Übergeben: {selection.provided}</li>
+                <li>Neu synchronisiert: {selection.syncedIds.length}</li>
+                <li>Bereits synchronisiert: {selection.alreadySynced.length}</li>
+                <li>Ungültiges Datum: {selection.invalidDate.length}</li>
+                <li>Nicht gefunden: {missingIds.length}</li>
+              </ul>
+              {queuedMissing.length > 0 && (
+                <details className="summary-details" open={!success}>
+                  <summary>Ohne YNAB-Transaktions-ID ({queuedMissing.length})</summary>
+                  <div className="summary-tags">
+                    {queuedMissing.slice(0, 12).map((id) => (
+                      <span key={id} className="tag warning">
+                        {id}
+                      </span>
+                    ))}
+                    {queuedMissing.length > 12 && (
+                      <span className="tag">+{queuedMissing.length - 12} weitere</span>
+                    )}
+                  </div>
+                </details>
+              )}
+              {queuedOthers.length > 0 && (
+                <details className="summary-details">
+                  <summary>Weitere in Warteschlange ({queuedOthers.length})</summary>
+                  <div className="summary-tags">
+                    {queuedOthers.slice(0, 12).map((id) => (
+                      <span key={id} className="tag muted">
+                        {id}
+                      </span>
+                    ))}
+                    {queuedOthers.length > 12 && (
+                      <span className="tag">+{queuedOthers.length - 12} weitere</span>
+                    )}
+                  </div>
+                </details>
+              )}
+              {missingIds.length > 0 && (
+                <details className="summary-details">
+                  <summary>Keine passende Transaktion ({missingIds.length})</summary>
+                  <div className="summary-tags">
+                    {missingIds.slice(0, 12).map((id) => (
+                      <span key={id} className="tag muted">
+                        {id}
+                      </span>
+                    ))}
+                    {missingIds.length > 12 && (
+                      <span className="tag">+{missingIds.length - 12} weitere</span>
+                    )}
+                  </div>
+                </details>
+              )}
+            </div>
+          )}
+
+          {filterEntries.length > 0 && (
+            <div className="summary-section">
+              <h4>Ausgeschlossene Transaktionen</h4>
+              <ul>
+                {filterEntries.map(({ label, data }) => (
+                  <li key={label}>
+                    <span className="summary-label-inline">{label}:</span> {data!.count}
+                    {data!.examples.length > 0 && (
+                      <span className="summary-examples"> (z.B. {data!.examples.slice(0, 5).join(', ')})</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {response && (
+            <div className="summary-section">
+              <h4>YNAB Antwort</h4>
+              <ul>
+                <li>Übermittelt: {response.requested}</li>
+                <li>Neue Transaktionen: {response.created}</li>
+                <li>Import-IDs bestätigt: {response.matchedImportIds}</li>
+                {duplicateImportIds.length > 0 && (
+                  <li>
+                    Duplikate: {duplicateImportIds.length}
+                    <span className="summary-examples"> (z.B. {duplicateImportIds.slice(0, 5).join(', ')})</span>
+                  </li>
+                )}
+                {missingImportIds.length > 0 && (
+                  <li className="error-text">
+                    Fehlende Import-IDs: {missingImportIds.length}
+                    <span className="summary-examples"> (z.B. {missingImportIds.slice(0, 5).join(', ')})</span>
+                  </li>
+                )}
+                {responseError && <li className="error-text">Fehler: {responseError}</li>}
+              </ul>
+            </div>
+          )}
+
+          {showOutput && (
+            <details className="summary-details">
+              <summary>Standardausgabe anzeigen</summary>
+              <pre className="summary-log">{output?.trim()}</pre>
+            </details>
+          )}
+
+          {showStderr && (
+            <details className="summary-details">
+              <summary>Fehlerausgabe anzeigen</summary>
+              <pre className="summary-log error-text">{stderr?.trim()}</pre>
+            </details>
+          )}
+        </div>
+        <div className="modal-footer">
+          <button type="button" className="btn-secondary" onClick={onClose}>
+            Schließen
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function TransactionList({ transactions, loading, onRefresh }: TransactionListProps) {
@@ -13,6 +278,10 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
   const [summaries, setSummaries] = useState<Record<string, { loading: boolean; summary?: string; error?: string; model?: string }>>({});
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
+  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+
+  const openSyncResult = (result: SyncResult) => setSyncResult(result);
+  const closeSyncResult = () => setSyncResult(null);
 
   const handleSelectAll = (checked: boolean) => {
     if (checked) {
@@ -38,7 +307,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
 
   const handleSyncToYnab = async () => {
     if (selectedIds.size === 0) {
-      alert('Bitte wählen Sie mindestens eine Transaktion aus.');
+      openSyncResult({ success: false, message: 'Bitte wählen Sie mindestens eine Transaktion aus.' });
       return;
     }
 
@@ -47,7 +316,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
       .map(t => t.orderId!);
 
     if (idsToSync.length === 0) {
-      alert('Keine unsynchronisierten Transaktionen ausgewählt.');
+      openSyncResult({ success: false, message: 'Keine unsynchronisierten Transaktionen ausgewählt.' });
       return;
     }
 
@@ -60,18 +329,31 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
       });
       const data = await response.json();
       if (data.success) {
-        alert('YNAB Sync erfolgreich!');
+        openSyncResult({
+          success: true,
+          message: data.message || 'YNAB Sync erfolgreich!',
+          summary: data.summary ?? null,
+          output: data.output ?? null,
+          stderr: data.stderr ?? null
+        });
         setSelectedIds(prev => {
           const next = new Set(prev);
           idsToSync.forEach(id => next.delete(id));
           return next;
         });
-        onRefresh(); // Liste aktualisieren
+        onRefresh();
       } else {
-        alert(`YNAB Sync fehlgeschlagen: ${data.message}`);
+        openSyncResult({
+          success: false,
+          message: data.message || 'YNAB Sync fehlgeschlagen',
+          summary: data.summary ?? null,
+          output: data.output ?? null,
+          stderr: data.stderr ?? null
+        });
       }
     } catch (error) {
-      alert('Fehler beim Sync mit YNAB');
+      console.error('Fehler beim Sync mit YNAB', error);
+      openSyncResult({ success: false, message: 'Fehler beim Sync mit YNAB' });
     } finally {
       setSyncLoading(false);
     }
@@ -124,7 +406,6 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
         [key]: { loading: false, summary: data.summary, model: data.model }
       }));
 
-      // Update aiSummary in transactions.json for consistency
       if (transaction.orderId) {
         fetch('http://localhost:3001/api/update-ai-summary', {
           method: 'POST',
@@ -366,6 +647,10 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
           })
         )}
       </div>
+
+      {syncResult && (
+        <SyncResultModal result={syncResult} onClose={closeSyncResult} />
+      )}
     </section>
   );
 }

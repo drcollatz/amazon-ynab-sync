@@ -494,6 +494,176 @@ main {
 }
 
 /* Responsive Design */
+/* Sync Result Modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 1000;
+}
+
+.modal {
+  background: white;
+  border-radius: 12px;
+  width: min(700px, 100%);
+  max-height: 90vh;
+  overflow: hidden;
+  box-shadow: 0 20px 45px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-success .modal-header {
+  background: rgba(40, 167, 69, 0.12);
+}
+
+.modal-error .modal-header {
+  background: rgba(220, 53, 69, 0.12);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid #eee;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 1.3rem;
+}
+
+.modal-close {
+  background: transparent;
+  border: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  line-height: 1;
+  color: #555;
+}
+
+.modal-close:hover {
+  color: #111;
+}
+
+.modal-body {
+  padding: 20px;
+  overflow: auto;
+}
+
+.modal-footer {
+  padding: 14px 20px;
+  border-top: 1px solid #eee;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.modal-message {
+  margin-bottom: 12px;
+  font-weight: 500;
+}
+
+.modal-timestamp {
+  margin-bottom: 20px;
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.summary-section {
+  margin-bottom: 18px;
+}
+
+.summary-section h4 {
+  margin-bottom: 8px;
+  font-size: 1rem;
+  color: #333;
+}
+
+.summary-section ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #444;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.summary-label {
+  display: block;
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.summary-value {
+  font-weight: 600;
+  font-size: 1.1rem;
+}
+
+.summary-label-inline {
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+.summary-examples {
+  color: #777;
+  font-size: 0.85rem;
+}
+
+.summary-details {
+  margin-top: 10px;
+}
+
+.summary-tags {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.8rem;
+  background: #f2f4f7;
+  color: #333;
+}
+
+.tag.warning {
+  background: rgba(255, 193, 7, 0.24);
+  color: #8a6d1d;
+}
+
+.tag.muted {
+  background: #ecf0f1;
+  color: #555;
+}
+
+.summary-log {
+  margin-top: 8px;
+  padding: 12px;
+  background: #0f172a;
+  color: #f8fafc;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.error-text {
+  color: #d9534f;
+}
+
 @media (max-width: 768px) {
   .app {
     padding: 10px;

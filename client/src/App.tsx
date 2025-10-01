@@ -16,6 +16,13 @@ export interface Transaction {
   orderItems?: { title: string; price?: string | null }[] | null;
   aiSummary?: string | null;
   ynabSynced?: boolean;
+  ynabSync?: {
+    at?: string;
+    importId?: string;
+    ynabTransactionId?: string | null;
+    duplicateImportId?: boolean;
+    amountMilliunits?: number | null;
+  } | null;
 }
 
 function App() {

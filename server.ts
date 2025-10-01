@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { exec, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import { promises as fs } from 'fs';
 import path from 'path';
 import OpenAI from 'openai';
@@ -36,6 +36,8 @@ interface Transaction {
     at?: string;
     importId?: string;
     ynabTransactionId?: string | null;
+    duplicateImportId?: boolean;
+    amountMilliunits?: number | null;
   } | null;
 }
 
@@ -207,22 +209,75 @@ function normalizeSyncOptions(raw: any): SyncRequestOptions | undefined {
 }
 
 // Helper function to run scripts
-function runScript(scriptPath: string): Promise<ScriptResult> {
+function runScript(scriptPath: string, args: string[] = []): Promise<ScriptResult> {
   return new Promise((resolve, reject) => {
-    exec(`npx ts-node ${scriptPath}`.trim(), (error, stdout, stderr) => {
-      if (error) {
-        const message = [`Script failed: ${error.message}`, stdout ? `STDOUT:\n${stdout}` : null, stderr ? `STDERR:\n${stderr}` : null]
-          .filter(Boolean)
-          .join('\n\n');
-        const scriptError = new Error(message) as ScriptError;
+    const child = spawn('npx', ['ts-node', scriptPath, ...args], {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32'
+    });
+
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+
+    if (child.stdout) {
+      child.stdout.on('data', (data: Buffer) => {
+        stdoutChunks.push(data.toString());
+      });
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', (data: Buffer) => {
+        stderrChunks.push(data.toString());
+      });
+    }
+
+    child.on('error', (error) => {
+      const stdout = stdoutChunks.join('');
+      const stderr = stderrChunks.join('');
+      const scriptError = new Error(error.message) as ScriptError;
+      scriptError.stdout = stdout;
+      scriptError.stderr = stderr;
+      reject(scriptError);
+    });
+
+    child.on('close', (code) => {
+      const stdout = stdoutChunks.join('');
+      const stderr = stderrChunks.join('');
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        const scriptError = new Error(`Script exited with code ${code}`) as ScriptError;
         scriptError.stdout = stdout;
         scriptError.stderr = stderr;
         reject(scriptError);
-      } else {
-        resolve({ stdout, stderr });
       }
     });
   });
+}
+
+function extractYnabSummary(stdout: string) {
+  const lines = stdout.split(/\r?\n/);
+  const cleaned: string[] = [];
+  let summary: unknown = null;
+
+  for (const line of lines) {
+    if (line.startsWith('[YNAB][SUMMARY] ')) {
+      if (summary === null) {
+        const payload = line.slice('[YNAB][SUMMARY] '.length).trim();
+        try {
+          summary = JSON.parse(payload);
+        } catch {
+          summary = null;
+        }
+      }
+      continue;
+    }
+    cleaned.push(line);
+  }
+
+  const cleanedStdout = cleaned.join('\n').trim();
+  return { summary, cleanedStdout };
 }
 
 function buildSyncArgs(options?: SyncRequestOptions): string[] {
@@ -616,13 +671,48 @@ app.post('/api/sync-ynab', async (req, res) => {
       return res.status(400).json({ error: 'transactionIds array required' });
     }
 
-    // For now, run the full ynab-sync.ts
-    // TODO: Modify ynab-sync.ts to accept selected transactions
-    const { stdout, stderr } = await runScript('ynab-sync.ts');
-    res.json({ success: true, message: 'YNAB Sync erfolgreich', output: stdout, stderr });
+    const uniqueIds = Array.from(
+      new Set(
+        transactionIds
+          .filter((id) => typeof id === 'string')
+          .map((id) => id.trim())
+          .filter((id) => id.length > 0)
+      )
+    );
+
+    const args: string[] = [];
+    if (uniqueIds.length > 0) {
+      args.push('--orders', JSON.stringify(uniqueIds));
+    }
+
+    console.log('[API] /api/sync-ynab angefordert', {
+      requested: uniqueIds.length,
+      sample: uniqueIds.slice(0, 10)
+    });
+
+    const { stdout, stderr } = await runScript('ynab-sync.ts', args);
+    const { summary, cleanedStdout } = extractYnabSummary(stdout);
+
+    if (summary) {
+      console.log('[API] YNAB Sync Summary', summary);
+    }
+
+    res.json({ success: true, message: 'YNAB Sync erfolgreich', output: cleanedStdout, stderr: stderr.trim(), summary });
   } catch (error) {
     const err = error as ScriptError;
-    res.status(500).json({ success: false, message: err.message, output: err.stdout, stderr: err.stderr });
+    const { summary, cleanedStdout } = extractYnabSummary(err.stdout || '');
+
+    if (summary) {
+      console.error('[API] YNAB Sync Fehlerzusammenfassung', summary);
+    }
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+      output: cleanedStdout,
+      stderr: (err.stderr || '').trim(),
+      summary
+    });
   }
 });
 
