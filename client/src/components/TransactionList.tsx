@@ -499,10 +499,20 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
   return (
     <section className="transaction-list">
       <div className="list-header">
-        <h2>Amazon Transaktionen</h2>
-        <button onClick={onRefresh} disabled={loading} className="btn-secondary">
-          {loading ? 'Lade...' : 'Aktualisieren'}
-        </button>
+        <div>
+          <h2>Amazon Transaktionen</h2>
+          <p className="list-subtitle">
+            {loading
+              ? 'Lade aktuelle Daten...'
+              : `Bereit für den Abgleich: ${unsyncedTransactions.length} offen, ${transactions.length} insgesamt.`}
+          </p>
+        </div>
+        <div className="list-header-actions">
+          {selectedIds.size > 0 && <span className="meta-pill">Ausgewählt: {selectedIds.size}</span>}
+          <button onClick={onRefresh} disabled={loading} className="btn-secondary">
+            {loading ? 'Lade...' : 'Aktualisieren'}
+          </button>
+        </div>
       </div>
 
       {selectableTransactions.length > 0 && (
@@ -549,108 +559,110 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
             const key = transaction.orderId ?? `idx-${index}`;
             const summaryState = summaries[key];
             return (
-              <div key={index} className={`transaction-item ${transaction.ynabSynced ? 'synced' : ''}`}>
-                <div className="transaction-checkbox">
-                {transaction.orderId && (
-                  <input
-                    type="checkbox"
-                    checked={selectedIds.has(transaction.orderId)}
-                    onChange={(e) => handleSelectTransaction(transaction.orderId!, e.target.checked)}
-                  />
-                )}
-              </div>
-              <div className="transaction-content">
-                <div className="transaction-header">
-                  <span className="date">{transaction.date || 'Unbekannt'}</span>
-                  <span className={`amount ${transaction.isRefund ? 'refund' : ''}`}>
-                    {transaction.amount}
-                  </span>
+              <div key={key} className={`transaction-card ${transaction.ynabSynced ? 'is-synced' : ''}`}>
+                <div className="transaction-card__select">
+                  {transaction.orderId && (
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(transaction.orderId)}
+                      onChange={(e) => handleSelectTransaction(transaction.orderId!, e.target.checked)}
+                    />
+                  )}
                 </div>
-                <div className="transaction-details">
-                  <span className="merchant">{transaction.merchant || 'Unbekannt'}</span>
-                  {transaction.orderItems && transaction.orderItems.length > 0 ? (
-                    <ol className="description-list">
-                      {transaction.orderItems.slice(0, 5).map((item, idx) => (
-                        <li key={`${transaction.orderId ?? 'order'}-${idx}`}>
-                          <span className="item-title">{item.title}</span>
-                          {item.price && (
-                            <span className="item-price">{item.price}</span>
-                          )}
-                        </li>
-                      ))}
-                      {transaction.orderItems.length > 5 && (
-                        <li className="item-more">+{transaction.orderItems.length - 5} weitere Artikel</li>
+                <div className="transaction-card__content">
+                  <div className="transaction-card__top">
+                    <div className="transaction-card__top-left">
+                      <span className="transaction-date">{transaction.date || 'Unbekannt'}</span>
+                      {(transaction.ynabSynced || transaction.isRefund) && (
+                        <div className="transaction-badges">
+                          {transaction.ynabSynced && <span className="badge badge-success">YNAB synchron</span>}
+                          {transaction.isRefund && <span className="badge badge-info">Erstattung</span>}
+                        </div>
                       )}
-                    </ol>
-                  ) : (
-                    transaction.orderDescription && (
-                      <span className="description">{transaction.orderDescription}</span>
-                    )
-                  )}
-                </div>
-                <div className="transaction-meta">
-                  {transaction.orderId && (
-                    <span className="order-id">Order: {transaction.orderId}</span>
-                  )}
-                  <button
-                    type="button"
-                    className="btn-icon"
-                    title="KI-Zusammenfassung erzeugen"
-                    onClick={() => handleSummarize(transaction, index)}
-                    disabled={summaryState?.loading}
-                  >
-                    {summaryState?.loading ? '…' : '🪄'}
-                  </button>
-                  {transaction.orderId && (
-                    <button
-                      type="button"
-                      className="btn-icon"
-                      title="YNAB-Status zurücksetzen"
-                      onClick={() => handleResetSingle(transaction.orderId)}
-                      disabled={resetLoading}
-                    >
-                      ♻️
-                    </button>
-                  )}
-                  {transaction.orderId && (
-                    <button
-                      type="button"
-                      className="btn-icon danger"
-                      title="Transaktion löschen"
-                      onClick={() => handleDeleteSingle(transaction.orderId)}
-                      disabled={deleteLoading}
-                    >
-                      🗑️
-                    </button>
-                  )}
-                  {transaction.ynabSynced && (
-                    <span className="sync-status synced">✓ Mit YNAB synchronisiert</span>
-                  )}
-                  {transaction.isRefund && (
-                    <span className="refund-badge">Erstattung</span>
-                  )}
-                </div>
-                {(summaryState?.summary || transaction.aiSummary) && (
-                  <div className="ai-summary">
-                    <strong>KI Memo:</strong> {summaryState?.summary || transaction.aiSummary}
-                    {summaryState?.model && (
-                      <span className="model-tag">{summaryState.model}</span>
+                    </div>
+                    <span className={`transaction-amount ${transaction.isRefund ? 'is-refund' : ''}`}>
+                      {transaction.amount}
+                    </span>
+                  </div>
+
+                  <div className="transaction-card__body">
+                    <span className="transaction-merchant">{transaction.merchant || 'Unbekannt'}</span>
+                    {transaction.orderItems && transaction.orderItems.length > 0 ? (
+                      <ol className="description-list">
+                        {transaction.orderItems.slice(0, 5).map((item, idx) => (
+                          <li key={`${transaction.orderId ?? 'order'}-${idx}`}>
+                            <span className="item-title">{item.title}</span>
+                            {item.price && <span className="item-price">{item.price}</span>}
+                          </li>
+                        ))}
+                        {transaction.orderItems.length > 5 && (
+                          <li className="item-more">+{transaction.orderItems.length - 5} weitere Artikel</li>
+                        )}
+                      </ol>
+                    ) : (
+                      transaction.orderDescription && (
+                        <span className="transaction-description">{transaction.orderDescription}</span>
+                      )
                     )}
                   </div>
-                )}
-                {summaryState?.error && (
-                  <div className="ai-summary error">{summaryState.error}</div>
-                )}
+
+                  <div className="transaction-card__footer">
+                    <div className="transaction-meta">
+                      {transaction.orderId && <span className="meta-pill">Order {transaction.orderId}</span>}
+                      {transaction.ynabSync?.importId && (
+                        <span className="meta-pill muted">Import {transaction.ynabSync.importId}</span>
+                      )}
+                    </div>
+                    <div className="transaction-actions">
+                      <button
+                        type="button"
+                        className="btn-icon"
+                        title="KI-Zusammenfassung erzeugen"
+                        onClick={() => handleSummarize(transaction, index)}
+                        disabled={summaryState?.loading}
+                      >
+                        {summaryState?.loading ? '…' : '🪄'}
+                      </button>
+                      {transaction.orderId && (
+                        <button
+                          type="button"
+                          className="btn-icon"
+                          title="YNAB-Status zurücksetzen"
+                          onClick={() => handleResetSingle(transaction.orderId)}
+                          disabled={resetLoading}
+                        >
+                          ♻️
+                        </button>
+                      )}
+                      {transaction.orderId && (
+                        <button
+                          type="button"
+                          className="btn-icon danger"
+                          title="Transaktion löschen"
+                          onClick={() => handleDeleteSingle(transaction.orderId)}
+                          disabled={deleteLoading}
+                        >
+                          🗑️
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {(summaryState?.summary || transaction.aiSummary) && (
+                    <div className="ai-summary">
+                      <strong>KI Memo:</strong> {summaryState?.summary || transaction.aiSummary}
+                      {summaryState?.model && <span className="model-tag">{summaryState.model}</span>}
+                    </div>
+                  )}
+                  {summaryState?.error && <div className="ai-summary error">{summaryState.error}</div>}
+                </div>
               </div>
-            </div>
-          );
+            );
           })
         )}
       </div>
 
-      {syncResult && (
-        <SyncResultModal result={syncResult} onClose={closeSyncResult} />
-      )}
+      {syncResult && <SyncResultModal result={syncResult} onClose={closeSyncResult} />}
     </section>
   );
 }

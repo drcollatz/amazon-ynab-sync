@@ -20,6 +20,83 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
   const [lastCount, setLastCount] = useState<number>(20);
   const [customRange, setCustomRange] = useState<{ start: string; end: string }>({ start: '', end: '' });
   const [syncValidationError, setSyncValidationError] = useState<string | null>(null);
+  const [estimatedDurationMs, setEstimatedDurationMs] = useState<number | null>(null);
+  const [progressNow, setProgressNow] = useState(() => Date.now());
+  const runningEstimateRef = useRef<number | null>(null);
+  const lastFinishedAtRef = useRef<number | null>(null);
+
+  const formatDuration = (value: number | null | undefined) => {
+    if (!Number.isFinite(value) || !value || value <= 0) return '0:00 min';
+    const totalSeconds = Math.round(value / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (minutes >= 60) {
+      const hours = Math.floor(minutes / 60);
+      const restMinutes = minutes % 60;
+      return `${hours}h ${restMinutes.toString().padStart(2, '0')}m`;
+    }
+    return `${minutes}:${seconds.toString().padStart(2, '0')} min`;
+  };
+
+  const computeFallbackDuration = () => {
+    if (syncMode === 'last-n') {
+      const count = Number.isFinite(lastCount) && lastCount > 0 ? Math.floor(lastCount) : 20;
+      const perItem = 11000; // empirische Schätzung pro Detailseite
+      return Math.min(Math.max(count * perItem, 90000), 12 * 60 * 1000);
+    }
+    if (syncMode === 'date-range') {
+      const start = Date.parse(customRange.start);
+      const end = Date.parse(customRange.end);
+      if (!Number.isNaN(start) && !Number.isNaN(end) && end >= start) {
+        const days = Math.max(1, Math.round((end - start) / (1000 * 60 * 60 * 24)) + 1);
+        return Math.min(Math.max(days * 60000, 120000), 12 * 60 * 1000);
+      }
+      return 240000;
+    }
+    return 180000;
+  };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem('sync-average-duration');
+    if (!stored) return;
+    const parsed = Number(stored);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      setEstimatedDurationMs(parsed);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (syncStatus?.status !== 'running') return;
+    const id = window.setInterval(() => setProgressNow(Date.now()), 500);
+    return () => window.clearInterval(id);
+  }, [syncStatus?.status]);
+
+  useEffect(() => {
+    if (syncStatus?.status === 'running') return;
+    setProgressNow(Date.now());
+  }, [syncStatus?.status]);
+
+  useEffect(() => {
+    if (!syncStatus || syncStatus.status !== 'success') return;
+    if (typeof syncStatus.startedAt !== 'number' || typeof syncStatus.finishedAt !== 'number') return;
+    if (syncStatus.finishedAt === lastFinishedAtRef.current) return;
+    lastFinishedAtRef.current = syncStatus.finishedAt;
+    const duration = syncStatus.finishedAt - syncStatus.startedAt;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    setEstimatedDurationMs(prev => {
+      const next = prev ? Math.round(prev * 0.5 + duration * 0.5) : duration;
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem('sync-average-duration', String(next));
+      }
+      return next;
+    });
+  }, [syncStatus]);
+
+  useEffect(() => {
+    if (!syncStatus || syncStatus.status === 'running') return;
+    runningEstimateRef.current = null;
+  }, [syncStatus?.status]);
 
   const fetchSyncStatus = async () => {
     try {
@@ -111,6 +188,8 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
         payload.endDate = customRange.end;
       }
 
+      runningEstimateRef.current = Math.max(60000, estimatedDurationMs ?? computeFallbackDuration());
+
       setLoading(prev => ({ ...prev, sync: true }));
       startPolling();
 
@@ -158,48 +237,91 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
 
   const renderSyncInfo = () => {
     if (!syncStatus) return null;
-    const { status, lastLog, error } = syncStatus;
+    const { status, error, lastLog, startedAt, finishedAt } = syncStatus;
 
-    let label: string | null = null;
     if (status === 'running') {
-      label = 'Sync läuft...';
-    } else if (status === 'success') {
-      label = 'Sync abgeschlossen';
-    } else if (status === 'error') {
-      label = 'Sync fehlgeschlagen';
+      const baseline = Math.max(60000, runningEstimateRef.current ?? estimatedDurationMs ?? computeFallbackDuration());
+      const start = typeof startedAt === 'number' ? startedAt : Date.now();
+      const elapsed = Math.max(0, progressNow - start);
+      const target = Math.max(baseline, elapsed + 1000);
+      const ratio = target > 0 ? Math.min(1, elapsed / target) : 0;
+      const fillPercent = Math.min(100, Math.max(4, ratio * 100));
+      const displayPercent = Math.min(100, Math.round(ratio * 100));
+      const remaining = Math.max(0, target - elapsed);
+      const etaTime = remaining > 60000
+        ? new Date(Date.now() + remaining).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
+        : null;
+      const hintText = estimatedDurationMs
+        ? `Schätzung basierend auf der letzten Laufzeit (${formatDuration(estimatedDurationMs)}).`
+        : 'Schätzung basierend auf den aktuellen Optionen.';
+
+      return (
+        <div className="sync-status-info status-running">
+          <div className="sync-status-label">Sync läuft…</div>
+          <div className="sync-progress">
+            <div
+              className="sync-progress-track"
+              role="progressbar"
+              aria-valuenow={displayPercent}
+              aria-valuemin={0}
+              aria-valuemax={100}
+            >
+              <div className="sync-progress-fill" style={{ width: `${fillPercent}%` }} />
+            </div>
+            <div className="sync-progress-meta">
+              <span className="sync-progress-value">{displayPercent}%</span>
+              <span>Laufzeit: {formatDuration(elapsed)}</span>
+              <span>Rest ca.: {remaining < 5000 ? 'gleich fertig' : formatDuration(remaining)}</span>
+              {etaTime && <span>Fertig um {etaTime} Uhr</span>}
+            </div>
+            <div className="sync-progress-hint">{hintText}</div>
+          </div>
+        </div>
+      );
     }
 
-    if (!label) return null;
+    if (status === 'success') {
+      const duration = typeof startedAt === 'number' && typeof finishedAt === 'number'
+        ? Math.max(0, finishedAt - startedAt)
+        : null;
+      const finishedLabel = typeof finishedAt === 'number'
+        ? new Date(finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
+        : null;
 
-    const trailingLogs = syncStatus.logs ? syncStatus.logs.slice(-3) : [];
+      return (
+        <div className="sync-status-info status-success">
+          <div className="sync-status-label">Sync abgeschlossen</div>
+          <div className="sync-progress-meta">
+            {duration !== null && <span>Gesamtdauer: {formatDuration(duration)}</span>}
+            {finishedLabel && <span>Fertig um {finishedLabel} Uhr</span>}
+          </div>
+        </div>
+      );
+    }
 
-    return (
-      <div className={`sync-status-info status-${status}`}>
-        <div className="sync-status-label">{label}</div>
-        {status === 'error' && error && (
-          <div className="sync-status-error">{error}</div>
-        )}
-        {trailingLogs.length > 0 && (
-          <ul className="sync-status-logs">
-            {trailingLogs.map((log, idx) => (
-              <li key={`${log.timestamp}-${idx}`}>{log.line}</li>
-            ))}
-          </ul>
-        )}
-        {trailingLogs.length === 0 && lastLog?.line && (
-          <div className="sync-status-single">{lastLog.line}</div>
-        )}
-      </div>
-    );
+    if (status === 'error') {
+      return (
+        <div className="sync-status-info status-error">
+          <div className="sync-status-label">Sync fehlgeschlagen</div>
+          {error && <div className="sync-status-error">{error}</div>}
+          {lastLog?.line && <div className="sync-status-single">{lastLog.line}</div>}
+        </div>
+      );
+    }
+
+    return null;
   };
 
   return (
     <section className="config-section">
-      <h2>Konfiguration</h2>
+      <div className="config-heading">
+        <h2>Konfiguration</h2>
+        <p>Steuern Sie Login und Sync-Einstellungen, bevor Sie Transaktionen importieren.</p>
+      </div>
 
       <div className="config-item">
         <h3>Amazon Login Status</h3>
-        <div className="status-display">
+        <div className="status-display" aria-live="polite">
           {loginStatus ? (
             <span className={loginStatus.valid ? 'status-valid' : 'status-invalid'}>
               {loginStatus.message}
