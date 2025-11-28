@@ -374,14 +374,34 @@ function startSyncScript(options?: SyncRequestOptions): Promise<ScriptResult> {
         syncState.status = 'success';
         resolve({ stdout, stderr });
       } else {
-        const message = `Sync script exited with code ${code}`;
+        // Extract additional error information from stderr
+        const errorLines = stderr.split('\n').filter(line => line.trim().length > 0);
+        const lastErrorLine = errorLines[errorLines.length - 1] || '';
+        
+        const baseMessage = `Sync script exited with code ${code}`;
+        const detailedMessage = lastErrorLine.includes('Error:')
+          ? `${baseMessage}: ${lastErrorLine}`
+          : `${baseMessage}: ${stderr.trim() || 'Unbekannter Fehler'}`;
+        
         syncState.status = 'error';
-        syncState.error = message;
-        syncState.logs.push({ line: message, stream: 'stderr', timestamp: Date.now() });
+        syncState.error = detailedMessage;
+        
+        // Add detailed error information to logs
+        syncState.logs.push({ line: `FEHLER: ${baseMessage}`, stream: 'stderr', timestamp: Date.now() });
+        
+        // Add stderr content to logs for debugging (limit to last 10 lines to avoid spam)
+        const errorLogLines = errorLines.slice(-10);
+        for (const line of errorLogLines) {
+          if (line.trim()) {
+            syncState.logs.push({ line: `STDERR: ${line}`, stream: 'stderr', timestamp: Date.now() });
+          }
+        }
+        
         if (syncState.logs.length > 200) {
           syncState.logs.splice(0, syncState.logs.length - 200);
         }
-        const error = new Error(message) as ScriptError;
+        
+        const error = new Error(detailedMessage) as ScriptError;
         error.stdout = stdout;
         error.stderr = stderr;
         reject(error);
@@ -417,7 +437,30 @@ app.post('/api/login', async (req, res) => {
     res.json({ success: true, message: 'Login erfolgreich', output: stdout, stderr });
   } catch (error) {
     const err = error as ScriptError;
-    res.status(500).json({ success: false, message: err.message, output: err.stdout, stderr: err.stderr });
+    
+    // Enhanced login error reporting
+    const message = err.message;
+    const stdout = err.stdout || '';
+    const stderr = err.stderr || '';
+    
+    let detailedMessage = message;
+    if (stderr.includes('Error:') || stderr.includes('timeout') || stderr.includes('login')) {
+      const errorLines = stderr.split('\n').filter(line => line.trim());
+      const relevantErrors = errorLines.slice(-3).join(' ');
+      detailedMessage = `Login fehlgeschlagen: ${relevantErrors}`;
+    }
+    
+    res.status(500).json({
+      success: false,
+      message: detailedMessage,
+      output: stdout,
+      stderr: stderr,
+      debug: {
+        hasStorageState: stdout.includes('storageState') || stdout.includes('StorageState'),
+        hasTimeout: stderr.includes('timeout') || stdout.includes('timeout'),
+        hasError: stderr.includes('Error:') || stdout.includes('Error:')
+      }
+    });
   }
 });
 
@@ -706,12 +749,46 @@ app.post('/api/sync-ynab', async (req, res) => {
       console.error('[API] YNAB Sync Fehlerzusammenfassung', summary);
     }
 
+    // Enhanced error reporting for YNAB sync
+    const errorMessage = err.message;
+    const stderrLines = (err.stderr || '').split('\n').filter(line => line.trim().length > 0);
+    const lastErrorLine = stderrLines[stderrLines.length - 1] || '';
+    
+    // More detailed error analysis
+    let detailedError = errorMessage;
+    if (lastErrorLine && !lastErrorLine.includes('Script exited with code')) {
+      detailedError = `${errorMessage}: ${lastErrorLine}`;
+    } else if (stderrLines.length > 0) {
+      // Look for specific YNAB error patterns
+      const ynabErrorPatterns = [
+        /YNAB HTTP (\d+):/,
+        /bitte.*setzen/i,
+        /token/i,
+        /budget/i,
+        /account/i,
+        /permission/i
+      ];
+      
+      for (const pattern of ynabErrorPatterns) {
+        const match = stderrLines.join(' ').match(pattern);
+        if (match) {
+          detailedError = `${errorMessage}: ${match[0]}`;
+          break;
+        }
+      }
+    }
+    
     res.status(500).json({
       success: false,
-      message: err.message,
+      message: detailedError,
       output: cleanedStdout,
       stderr: (err.stderr || '').trim(),
-      summary
+      summary,
+      debug: {
+        code: err.message.includes('code 1') ? 1 : undefined,
+        stderrLines: stderrLines.slice(-5), // Last 5 error lines
+        hasYnabError: stderrLines.some(line => /YNAB|HTTP|token|budget|account/i.test(line))
+      }
     });
   }
 });

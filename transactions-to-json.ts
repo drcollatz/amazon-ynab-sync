@@ -251,87 +251,279 @@ async function extractTransactions(page: Page, options: CliOptions): Promise<Tra
   console.log("   Scrolle für Lazy-Load...");
   await slowScroll(page);
 
-  const rowSel = ".apx-transactions-line-item-component-container";
-  await page.waitForSelector(rowSel, { timeout: 15000 });
+  // Multiple fallback selectors for Amazon transactions (they change their classes frequently)
+  const transactionSelectors = [
+    ".apx-transactions-line-item-component-container", // Legacy
+    "[data-component='transactionsGrid']",              // New Amazon structure
+    ".a-container:has([data-testid*='transaction'])",  // Test ID based
+    "div[aria-label*='transact']",                     // ARIA label
+    "li[data-testid*='order']",                        // Order-based
+    ".a-container",                                    // Generic Amazon containers
+    ".orders-container"                                // Orders page
+  ];
+  
+  let selectorFound = false;
+  let foundSelector = '';
+  let lastError = '';
+  
+  // Try each selector with short timeout
+  for (const selector of transactionSelectors) {
+    try {
+      await page.waitForSelector(selector, { timeout: 3000 });
+      foundSelector = selector;
+      selectorFound = true;
+      console.log(`✅ Found transactions using selector: ${selector}`);
+      break;
+    } catch (error) {
+      lastError = (error as Error).message;
+      continue;
+    }
+  }
+  
+  if (!selectorFound) {
+    console.error(`❌ No transaction selector found. Last error: ${lastError}`);
+    console.log("Available selectors tried:", transactionSelectors);
+    
+    // Try a more general approach - wait for any content and debug
+    try {
+      await page.waitForSelector('body', { timeout: 5000 });
+      console.log("🔍 Page loaded, checking for Amazon login state...");
+      
+      // Check if we're on login page
+      const currentUrl = page.url();
+      console.log("Current URL:", currentUrl);
+      
+      if (currentUrl.includes('signin') || currentUrl.includes('login')) {
+        throw new Error("Amazon is asking for login - storage state expired or invalid");
+      }
+      
+      // Try to find any transaction-like content
+      const potentialElements = await page.$$('div, li, section, article');
+      console.log(`Found ${potentialElements.length} potential elements on page`);
+      
+      // Look for text patterns that might indicate transactions
+      const pageText = await page.textContent('body');
+      if (pageText && (pageText.includes('Bestellung') || pageText.includes('order') || pageText.includes('transaction'))) {
+        console.log("Found transaction-related text on page, trying general selectors...");
+        selectorFound = true; // Assume we can proceed
+        foundSelector = 'body'; // Use body as fallback
+      } else {
+        throw new Error(`No transaction content found on page. URL: ${currentUrl}`);
+      }
+    } catch (debugError) {
+      throw new Error(`Amazon page analysis failed: ${(debugError as Error).message}`);
+    }
+  }
+  
+  console.log(`Using selector: ${foundSelector} for transaction extraction`);
 
   console.log("   Lese DOM und parsiere Transaktionen...");
   const maxEntries = options.mode === 'last-n'
     ? Math.max(options.lastCount ?? 20, 1)
     : 500;
 
-  const txs = await page.$$eval(rowSel, (rows, limit) => {
-    const sanitize = (t?: string | null) => (t ?? "").replace(/\s+/g, " ").trim() || null;
-
-    const getPrevDate = (el: Element): string | null => {
-      let p: Element | null = el.previousElementSibling;
-      while (p) {
-        if (p.classList.contains("apx-transaction-date-container")) {
-          const span = p.querySelector("span");
-          return sanitize(span?.textContent ?? "");
-        }
-        p = p.previousElementSibling;
-      }
-      let parent: Element | null = el.parentElement;
-      while (parent) {
-        let q: Element | null = parent.previousElementSibling;
-        while (q) {
-          if (q.classList.contains("apx-transaction-date-container")) {
-            const span = q.querySelector("span");
-            return sanitize(span?.textContent ?? "");
-          }
-          q = q.previousElementSibling;
-        }
-        parent = parent.parentElement;
-      }
-      return null;
-    };
-
-    return rows.slice(0, limit as number).map((row) => {
-      const amount =
-        sanitize(row.querySelector(".a-size-base-plus.a-text-bold")?.textContent) ||
-        sanitize(row.querySelector(".a-size-base.a-text-bold")?.textContent);
-
-      const paymentInstrument =
-        sanitize(row.querySelector(".a-row .a-column .a-size-base.a-text-bold")?.textContent);
-
-      let merchant: string | null = null;
-      const merchantCands = Array.from(row.querySelectorAll(".a-size-base"))
-        .filter((el) => !el.classList.contains("a-text-bold"));
-      if (merchantCands.length) merchant = sanitize(merchantCands[0].textContent);
-
-      const orderLinkEl = row.querySelector<HTMLAnchorElement>('a.a-link-normal[href*="orderID="]');
-      let orderUrl: string | null = null;
-      const orderUrlRaw = orderLinkEl?.href || orderLinkEl?.getAttribute("href") || null;
-      if (orderUrlRaw) {
-        try {
-          orderUrl = new URL(orderUrlRaw, window.location.origin).toString();
-        } catch (e) {
-          console.warn('Konnte orderUrl nicht normalisieren', orderUrlRaw);
-        }
-      }
-      const orderId = orderUrl ? (orderUrl.match(/orderID=([A-Z0-9-]+)/i)?.[1] ?? null) : null;
-
-      const linkText = sanitize(orderLinkEl?.textContent) ?? "";
-      const isRefund = /^Erstattung/i.test(linkText);
-
-      const date = getPrevDate(row);
-
-      return {
-        date,
-        amount,
-        paymentInstrument,
-        merchant,
-        orderId,
-        orderUrl: orderUrl,
-        isRefund,
-        orderDescription: null,
-        orderItems: null
-      } as Transaction;
+  // Enhanced debug mode - let's see what we're actually working with!
+  const debugInfo = await page.evaluate((selector) => {
+    const results: any[] = [];
+    const elements = document.querySelectorAll(selector);
+    
+    console.log(`[DEBUG] Found ${elements.length} elements with selector: ${selector}`);
+    
+    elements.forEach((el, idx) => {
+      const debug = {
+        index: idx,
+        tagName: el.tagName,
+        className: el.className,
+        id: el.id,
+        textContent: (el.textContent || "").substring(0, 200),
+        outerHTML: (el.outerHTML || "").substring(0, 500),
+        children: el.children.length,
+        childTags: Array.from(el.children).map(child => ({
+          tag: child.tagName,
+          class: child.className,
+          text: (child.textContent || "").trim().substring(0, 50)
+        })),
+        hrefs: Array.from(el.querySelectorAll('a[href]')).map(a => ({
+          href: (a as HTMLAnchorElement).href,
+          text: (a.textContent || "").trim()
+        })),
+        amounts: Array.from(el.querySelectorAll('.a-size-base-plus, .a-text-bold, [class*="price"], [class*="amount"]')).map(a => ({
+          text: (a.textContent || "").trim(),
+          class: a.className
+        })),
+        dates: Array.from(el.querySelectorAll('[class*="date"], [class*="zeit"], time')).map(d => ({
+          text: (d.textContent || "").trim(),
+          class: d.className
+        })),
+        merchants: Array.from(el.querySelectorAll('.a-size-base:not(.a-text-bold), [class*="merchant"], [class*="seller"]')).map(m => ({
+          text: (m.textContent || "").trim(),
+          class: m.className
+        }))
+      };
+      results.push(debug);
     });
-  }, maxEntries);
+    
+    return results;
+  }, foundSelector);
+
+  console.log("[DEBUG] Detailed DOM analysis of found elements:");
+  debugInfo.forEach((debug, idx) => {
+    console.log(`\n=== ELEMENT ${idx + 1} ===`);
+    console.log(`Tag: ${debug.tagName}, Class: ${debug.className}`);
+    console.log(`Text content: ${debug.textContent}`);
+    console.log(`Children: ${debug.children}`);
+    console.log("Child elements:");
+    debug.childTags.forEach((child: any) => {
+      console.log(`  - <${child.tag} class="${child.class}">${child.text}</>`);
+    });
+    if (debug.hrefs.length > 0) {
+      console.log("Links found:");
+      debug.hrefs.forEach((href: any) => {
+        console.log(`  - "${href.text}" -> ${href.href}`);
+      });
+    }
+    if (debug.amounts.length > 0) {
+      console.log("Amount candidates:");
+      debug.amounts.forEach((amount: any) => {
+        console.log(`  - "${amount.text}" (class: ${amount.class})`);
+      });
+    }
+    if (debug.dates.length > 0) {
+      console.log("Date candidates:");
+      debug.dates.forEach((date: any) => {
+        console.log(`  - "${date.text}" (class: ${date.class})`);
+      });
+    }
+    if (debug.merchants.length > 0) {
+      console.log("Merchant candidates:");
+      debug.merchants.forEach((merchant: any) => {
+        console.log(`  - "${merchant.text}" (class: ${merchant.class})`);
+      });
+    }
+    console.log("Raw HTML snippet (first 1000 chars):");
+    console.log(debug.outerHTML);
+  });
+  
+  console.log("\n[DEBUG] RECOMMENDATIONS:");
+  console.log("Based on the analysis above, modify the transaction selectors in the code:");
+  console.log("- For amounts: look for .a-size-base-plus, .a-text-bold, [class*='price']");
+  console.log("- For dates: look for [class*='date'], [class*='zeit'], time elements");
+  console.log("- For merchants: look for .a-size-base:not(.a-text-bold), [class*='merchant']");
+  console.log("- For order IDs: look for a[href*='orderID'] links");
+  console.log("Update the $eval function to use the correct selectors based on this analysis.");
+
+  // Parse transaction data from link texts (Amazon format) 
+  console.log("[TRANSACTION] Starting transaction parsing from link texts...");
+  let txs: any[] = [];
+  try {
+    // Use the same selector as the debug analysis to find the right elements
+    const linkTexts = await page.evaluate((selector) => {
+      const results: Array<{text: string, href: string}> = [];
+      const elements = document.querySelectorAll(selector);
+      
+      console.log(`[TRANSACTION] Analyzing ${elements.length} elements with selector: ${selector}`);
+      
+      elements.forEach((el, idx) => {
+        const links = el.querySelectorAll('a[href]');
+        console.log(`[TRANSACTION] Element ${idx + 1} has ${links.length} transaction links`);
+        
+        links.forEach((link) => {
+          const text = (link.textContent || "").trim();
+          const href = (link as HTMLAnchorElement).href;
+          if (text && href) {
+            console.log(`[TRANSACTION] Found transaction link: "${text}"`);
+            results.push({text, href});
+          }
+        });
+      });
+      
+      return results;
+    }, foundSelector);
+    
+    console.log(`[TRANSACTION] Found ${linkTexts.length} total links to process`);
+    
+    for (let i = 0; i < linkTexts.length; i++) {
+      const {text: linkText, href: linkHref} = linkTexts[i];
+      console.log(`[TRANSACTION] Processing link ${i + 1}: "${linkText}"`);
+      
+      if (linkText && linkHref) {
+        // Check if this looks like a transaction
+        if (linkText.includes('Bestellnummer') && (linkText.includes('€') || /\d{1,2}\.\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i.test(linkText))) {
+          console.log(`[TRANSACTION] Transaction detected, parsing...`);
+          
+          // Extract order ID
+          const orderIdMatch = linkText.match(/Bestellnummer\s+([0-9-]+)/);
+          const orderId = orderIdMatch ? orderIdMatch[1].replace(/-$/, '') : null;
+          
+          // Extract amount
+          const amountMatch = linkText.match(/([+-]?€\d+[.,]\d{2})/);
+          const amount = amountMatch ? amountMatch[1] : null;
+          
+          // Extract date
+          const dateMatch = linkText.match(/(\d{1,2}\.\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{4})/i);
+          const date = dateMatch ? dateMatch[1] : null;
+          
+          // Extract merchant - improve parsing logic
+          let merchant = null;
+          if (date) {
+            // Look for merchant between date and payment instrument
+            const afterDate = linkText.substring(linkText.indexOf(date) + date.length);
+            // Pattern: Date · Merchant · PaymentInstrument
+            const merchantMatch = afterDate.match(/·([^·]+)·/);
+            if (merchantMatch) {
+              merchant = merchantMatch[1].trim();
+            } else {
+              // Fallback: look for any text after date that's not the payment instrument
+              const parts = afterDate.split('·');
+              if (parts.length > 1) {
+                merchant = parts[0].trim();
+              }
+            }
+          }
+          
+          // Extract payment instrument
+          const cardMatch = linkText.match(/(Amazon Visa|Santander-Punkte|AMAZON|AMZN)/);
+          const paymentInstrument = cardMatch ? cardMatch[1] : null;
+          
+          // Check if it's a refund
+          const isRefund = linkText.includes('Erstattet') || amountMatch?.[1]?.startsWith('+');
+          
+          // Create transaction object
+          if (date || amount || orderId) {
+            // Generate proper order details URL since linkHref points to transaction page
+            const orderUrl = orderId ? `https://www.amazon.de/gp/css/summary/edit.html?orderID=${orderId}` : linkHref;
+            
+            const transaction = {
+              date,
+              amount,
+              paymentInstrument,
+              merchant,
+              orderId,
+              orderUrl,
+              isRefund,
+              orderDescription: null,
+              orderItems: null
+            };
+            
+            txs.push(transaction);
+            console.log(`[TRANSACTION] Added: ${orderId || 'no-id'} - ${amount} - ${merchant || 'no-merchant'}`);
+          } else {
+            console.log(`[TRANSACTION] Skipped - insufficient data`);
+          }
+        } else {
+          console.log(`[TRANSACTION] Skipped - not a transaction link`);
+        }
+      }
+    }
+    
+    console.log(`[TRANSACTION] Total transactions extracted: ${txs.length}`);
+  } catch (error) {
+    console.error("[TRANSACTION] Error during transaction parsing:", error);
+    txs = [];
+  }
 
   // Filter out Amazon Punkte Punkte transactions as per user request
-  const filtered = txs.filter(t => t.paymentInstrument !== "Amazon Punkte Punkte");
+  const filtered = txs.filter((t: any) => t.paymentInstrument !== "Amazon Punkte Punkte");
   const byMode = applySyncFilters(filtered, options);
   console.log(`   Gefundene Transaktionen gesamt: ${txs.length}, gefiltert: ${filtered.length}, nach Modus (${options.mode}): ${byMode.length}`);
   console.timeEnd("phase:extractTransactions");
@@ -684,6 +876,49 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(e);
+  console.error("=== AMAZON SCRAPING FEHLER ===");
+  console.error("Error:", e.message || e);
+  console.error("Error Type:", e.constructor?.name || 'Unknown');
+  console.error("Stack:", e.stack || 'No stack trace');
+  
+  // Environment debugging
+  console.error("=== ENVIRONMENT INFO ===");
+  console.error("Playwright version:", require('playwright').version || 'Unknown');
+  console.error("Node.js version:", process.version);
+  console.error("Platform:", process.platform);
+  console.error("HEADLESS mode:", HEADLESS);
+  console.error("Options:", cliOptions);
+  
+  // Common error scenarios and solutions
+  if (e.message?.includes('Timeout') || e.message?.includes('timeout')) {
+    console.error("=== TIMEOUT ERROR ===");
+    console.error("Mögliche Ursachen:");
+    console.error("- Amazon blockiert den Zugriff (Captcha/Rate Limiting)");
+    console.error("- Langsame Internetverbindung");
+    console.error("- Login State ist abgelaufen - login.ts erneut ausführen");
+    console.error("Lösungen:");
+    console.error("1. login.ts ausführen um storageState zu erneuern");
+    console.error("2. Weniger Transaktionen anfordern (--last 10)");
+    console.error("3. HEADLESS=false setzen für visuelles Debugging");
+  } else if (e.message?.includes('login') || e.message?.includes('Login') || e.message?.includes('signin')) {
+    console.error("=== LOGIN ERROR ===");
+    console.error("Login State ist ungültig oder abgelaufen.");
+    console.error("Führe zuerst login.ts aus um storageState zu erneuern.");
+  } else if (e.message?.includes('storageState') || e.message?.includes('storage')) {
+    console.error("=== STORAGE STATE ERROR ===");
+    console.error("Amazon storage state ist nicht verfügbar oder ungültig.");
+    console.error("Führe login.ts aus um den Login-Prozess zu starten.");
+  } else if (e.message?.includes('captcha') || e.message?.includes('Captcha')) {
+    console.error("=== CAPTCHA ERROR ===");
+    console.error("Amazon hat ein Captcha gestellt.");
+    console.error("Führe login.ts aus und löse das Captcha manuell.");
+  }
+  
+  console.error("=== DEBUG TIPS ===");
+  console.error("1. Prüfe .env Datei auf fehlende Variablen");
+  console.error("2. Führe login.ts aus falls Login erforderlich");
+  console.error("3. Setze HEADLESS=false für visuelles Debugging");
+  console.error("4. Prüfe Internetverbindung und Amazon-Erreichbarkeit");
+  console.error("=== END ERROR ===");
   process.exit(1);
 });

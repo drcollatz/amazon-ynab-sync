@@ -1,4 +1,4 @@
-import { useState } from 'react';
+uimport { useState } from 'react';
 import type { Transaction } from '../App';
 
 const euroFormatter = new Intl.NumberFormat('de-DE', {
@@ -379,7 +379,8 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
   };
 
   const handleSummarize = async (transaction: Transaction, index: number) => {
-    const key = transaction.orderId ?? `idx-${index}`;
+    // Create the same unique key as used in the render
+    const key = transaction.orderId ? `${transaction.orderId}-${index}` : `idx-${index}`;
     const text = buildSummaryText(transaction);
     if (!text) return;
 
@@ -556,7 +557,9 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
           <p>Keine Transaktionen gefunden. Führen Sie zuerst einen Sync durch.</p>
         ) : (
           transactions.map((transaction, index) => {
-            const key = transaction.orderId ?? `idx-${index}`;
+            // Create a truly unique key to prevent React key conflicts
+            // Use orderId + index to ensure uniqueness, fallback to just index
+            const key = transaction.orderId ? `${transaction.orderId}-${index}` : `idx-${index}`;
             const summaryState = summaries[key];
             return (
               <div key={key} className={`transaction-card ${transaction.ynabSynced ? 'is-synced' : ''}`}>

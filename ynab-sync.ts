@@ -259,9 +259,34 @@ function parseGermanDateToISO(d: string): string | null {
 function amountToMilliunits(amountStr: string, isRefundFlag: boolean): number {
   const isPositive = amountStr.includes("+") || isRefundFlag;
   const sign = isPositive ? 1 : -1;
-  const numeric = amountStr.replace(/[^\d,]/g, "").replace(",", ".");
-  const value = parseFloat(numeric || "0");
-  return Math.round(sign * value * 1000);
+  
+  // Handle both German (€,) and English (€.) format
+  const cleanAmount = amountStr.replace(/[^\d,.-]/g, "");
+  let numeric: number;
+  
+  if (cleanAmount.includes(",") && !cleanAmount.includes(".")) {
+    // German format: "19,94" -> "19.94"
+    numeric = parseFloat(cleanAmount.replace(",", "."));
+  } else if (cleanAmount.includes(".") && !cleanAmount.includes(",")) {
+    // English format: "19.94" -> 19.94
+    numeric = parseFloat(cleanAmount);
+  } else if (cleanAmount.includes(",") && cleanAmount.includes(".")) {
+    // Both present - assume last occurrence is decimal separator
+    const lastComma = cleanAmount.lastIndexOf(",");
+    const lastDot = cleanAmount.lastIndexOf(".");
+    if (lastComma > lastDot) {
+      // German format with thousands separator: "1.234,56" -> "1234.56"
+      numeric = parseFloat(cleanAmount.replace(/\./g, "").replace(",", "."));
+    } else {
+      // English format with thousands separator: "1,234.56" -> "1234.56"
+      numeric = parseFloat(cleanAmount.replace(/,/g, ""));
+    }
+  } else {
+    // No separators, just digits
+    numeric = parseFloat(cleanAmount);
+  }
+  
+  return Math.round(sign * numeric * 1000);
 }
 
 async function httpPostJSON(url: string, body: any, token: string): Promise<YnabResponse> {
@@ -528,10 +553,55 @@ const summary: SyncSummary = {
     console.log(`✅ Sync fertig. Datei aktualisiert: ${INPUT_FILE}`);
   } catch (error: any) {
     const message = error?.message || String(error);
+    const stack = error?.stack || 'No stack trace available';
+    
+    // Enhanced error logging for better debugging
+    console.error("=== YNAB SYNC FEHLER ===");
+    console.error("Error Message:", message);
+    console.error("Error Type:", error?.constructor?.name || 'Unknown');
+    console.error("Stack Trace:", stack);
+    
+    // Log environment information for debugging
+    console.error("=== ENVIRONMENT ===");
+    console.error("YNAB_TOKEN exists:", !!YNAB_TOKEN);
+    console.error("YNAB_BUDGET_ID:", YNAB_BUDGET_ID);
+    console.error("YNAB_ACCOUNT_ID exists:", !!YNAB_ACCOUNT_ID);
+    console.error("INPUT_FILE:", INPUT_FILE);
+    console.error("File exists:", require('fs').existsSync(INPUT_FILE));
+    console.error("DRY_RUN:", DRY_RUN);
+    console.error("Selected Order IDs:", selectedOrderIds.length);
+    
+    // If it's a network/HTTP error, log more details
+    if (message.includes('HTTP') || message.includes('fetch') || message.includes('network')) {
+      console.error("=== NETWORK ERROR DETAILS ===");
+      console.error("This appears to be a network-related error.");
+      console.error("Please check your internet connection and YNAB API accessibility.");
+    }
+    
+    // If it's an environment variable error
+    if (message.includes('YNAB_TOKEN') || message.includes('environment') || !YNAB_TOKEN || !YNAB_ACCOUNT_ID) {
+      console.error("=== ENVIRONMENT VARIABLE ERROR ===");
+      console.error("Please ensure these environment variables are set:");
+      console.error("- YNAB_TOKEN: Your YNAB personal access token");
+      console.error("- YNAB_ACCOUNT_ID: Your YNAB account ID");
+      console.error("Check your .env file or environment configuration.");
+    }
+    
+    // If it's a file error
+    if (message.includes('ENOENT') || message.includes('readFileSync') || message.includes('transactions.json')) {
+      console.error("=== FILE ERROR ===");
+      console.error("The transactions.json file could not be read.");
+      console.error("This might indicate:");
+      console.error("1. File doesn't exist - run transactions-to-json.ts first");
+      console.error("2. File is corrupted or invalid JSON");
+      console.error("3. Insufficient file permissions");
+    }
+    
     summary.response.error = message;
-    console.error("YNAB Sync fehlgeschlagen:", message);
+    console.error("=== SYNC SUMMARY AT ERROR ===");
     summary.selection = buildSelectionSummary(selectionStatusMap);
-    console.log(`[YNAB][SUMMARY] ${JSON.stringify(summary)}`);
+    console.log(`[YNAB][SUMMARY] ${JSON.stringify(summary, null, 2)}`);
+    console.error("=== END ERROR LOG ===");
     process.exit(2);
   }
 })();
