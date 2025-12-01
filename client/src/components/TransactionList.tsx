@@ -1,4 +1,4 @@
-uimport { useState } from 'react';
+import { useState, useMemo } from 'react';
 import type { Transaction } from '../App';
 
 const euroFormatter = new Intl.NumberFormat('de-DE', {
@@ -74,9 +74,14 @@ interface SyncSummary {
 interface SyncResult {
   success: boolean;
   message: string;
+  error?: string;
   summary?: SyncSummary | null;
   output?: string | null;
   stderr?: string | null;
+  configurationHelp?: {
+    missing: string[];
+    instructions: string[];
+  };
 }
 
 interface SyncResultModalProps {
@@ -90,7 +95,7 @@ function formatCurrencyFromMilliunits(value?: number | null): string | null {
 }
 
 function SyncResultModal({ result, onClose }: SyncResultModalProps) {
-  const { success, message, summary, output, stderr } = result;
+  const { success, message, summary, output, stderr, configurationHelp } = result;
   const selection = summary?.selection;
   const statuses = selection?.statuses ?? {};
   const queuedIds = selection?.queuedIds ?? [];
@@ -110,6 +115,7 @@ function SyncResultModal({ result, onClose }: SyncResultModalProps) {
   const showOutput = Boolean(output && output.trim().length > 0);
   const showStderr = Boolean(stderr && stderr.trim().length > 0);
   const response = summary?.response;
+  const isConfigError = Boolean(configurationHelp);
 
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onClose}>
@@ -118,14 +124,54 @@ function SyncResultModal({ result, onClose }: SyncResultModalProps) {
         onClick={(event) => event.stopPropagation()}
       >
         <div className="modal-header">
-          <h3>{success ? 'YNAB Sync erfolgreich' : 'YNAB Sync fehlgeschlagen'}</h3>
+          <h3>{isConfigError ? 'YNAB Konfiguration fehlt' : (success ? 'YNAB Sync erfolgreich' : 'YNAB Sync fehlgeschlagen')}</h3>
           <button type="button" className="modal-close" onClick={onClose} aria-label="Schließen">
             ×
           </button>
         </div>
         <div className="modal-body">
           <p className="modal-message">{message}</p>
-          {timestamp && <p className="modal-timestamp">Zeitpunkt: {timestamp}</p>}
+          
+          {configurationHelp && (
+            <div className="config-help">
+              <h4>🔧 Fehlende Konfiguration</h4>
+              <p>Die folgenden Umgebungsvariablen fehlen:</p>
+              <ul className="missing-config-list">
+                {configurationHelp.missing.map((item) => (
+                  <li key={item}><code>{item}</code></li>
+                ))}
+              </ul>
+              
+              <h4>📋 Anleitung zur Konfiguration</h4>
+              <ol className="config-instructions">
+                {configurationHelp.instructions.map((instruction, idx) => (
+                  <li key={idx}>{instruction}</li>
+                ))}
+              </ol>
+              
+              <div className="config-example">
+                <h5>Beispiel .env Datei:</h5>
+                <pre>
+{`YNAB_TOKEN=dein_personal_access_token_hier
+YNAB_ACCOUNT_ID=deine_account_id_hier
+YNAB_BUDGET_ID=last-used`}
+                </pre>
+              </div>
+              
+              <div className="config-links">
+                <a 
+                  href="https://app.youneedabudget.com/settings/developer" 
+                  target="_blank" 
+                  rel="noopener noreferrer"
+                  className="btn-primary"
+                >
+                  🔑 YNAB Personal Access Token holen
+                </a>
+              </div>
+            </div>
+          )}
+          
+          {!isConfigError && timestamp && <p className="modal-timestamp">Zeitpunkt: {timestamp}</p>}
 
           {summary && (
             <div className="summary-section">
@@ -273,7 +319,8 @@ function SyncResultModal({ result, onClose }: SyncResultModalProps) {
 }
 
 function TransactionList({ transactions, loading, onRefresh }: TransactionListProps) {
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Use index-based selection to handle duplicate order IDs
+  const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
   const [syncLoading, setSyncLoading] = useState(false);
   const [summaries, setSummaries] = useState<Record<string, { loading: boolean; summary?: string; error?: string; model?: string }>>({});
   const [deleteLoading, setDeleteLoading] = useState(false);
@@ -283,36 +330,67 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
   const openSyncResult = (result: SyncResult) => setSyncResult(result);
   const closeSyncResult = () => setSyncResult(null);
 
+  // Group transactions by orderId to find Santander-Punkte companions
+  const transactionGroups = useMemo(() => {
+    const groups = new Map<string, Transaction[]>();
+    transactions.forEach(tx => {
+      if (tx.orderId) {
+        if (!groups.has(tx.orderId)) {
+          groups.set(tx.orderId, []);
+        }
+        groups.get(tx.orderId)!.push(tx);
+      }
+    });
+    return groups;
+  }, [transactions]);
+
+  // Filter out standalone Santander-Punkte transactions (they'll be shown in their main transaction)
+  const visibleTransactions = useMemo(() => {
+    return transactions.filter((tx) => {
+      const isSantanderPunkte = tx.paymentInstrument?.includes('Santander-Punkte');
+      if (!isSantanderPunkte) return true;
+      
+      // Check if there's a main transaction for the same order
+      if (tx.orderId && transactionGroups.has(tx.orderId)) {
+        const group = transactionGroups.get(tx.orderId)!;
+        const hasMainTransaction = group.some(t => !t.paymentInstrument?.includes('Santander-Punkte'));
+        // Hide if there's a main transaction, show if it's standalone
+        return !hasMainTransaction;
+      }
+      return true;
+    });
+  }, [transactions, transactionGroups]);
+
   const handleSelectAll = (checked: boolean) => {
     if (checked) {
-      const allIds = transactions
-        .filter(t => t.orderId)
-        .map(t => t.orderId!)
-        .filter(Boolean);
-      setSelectedIds(new Set(allIds));
+      const allIndices = visibleTransactions
+        .map((_, index) => index)
+        .filter(index => visibleTransactions[index].orderId);
+      setSelectedIndices(new Set(allIndices));
     } else {
-      setSelectedIds(new Set());
+      setSelectedIndices(new Set());
     }
   };
 
-  const handleSelectTransaction = (orderId: string, checked: boolean) => {
-    const newSelected = new Set(selectedIds);
+  const handleSelectTransaction = (index: number, checked: boolean) => {
+    const newSelected = new Set(selectedIndices);
     if (checked) {
-      newSelected.add(orderId);
+      newSelected.add(index);
     } else {
-      newSelected.delete(orderId);
+      newSelected.delete(index);
     }
-    setSelectedIds(newSelected);
+    setSelectedIndices(newSelected);
   };
 
   const handleSyncToYnab = async () => {
-    if (selectedIds.size === 0) {
+    if (selectedIndices.size === 0) {
       openSyncResult({ success: false, message: 'Bitte wählen Sie mindestens eine Transaktion aus.' });
       return;
     }
 
-    const idsToSync = transactions
-      .filter(t => t.orderId && !t.ynabSynced && selectedIds.has(t.orderId))
+    const idsToSync = Array.from(selectedIndices)
+      .map(index => visibleTransactions[index])
+      .filter(t => t && t.orderId && !t.ynabSynced)
       .map(t => t.orderId!);
 
     if (idsToSync.length === 0) {
@@ -329,6 +407,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
       });
       const data = await response.json();
       if (data.success) {
+        // First show success modal
         openSyncResult({
           success: true,
           message: data.message || 'YNAB Sync erfolgreich!',
@@ -336,19 +415,31 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
           output: data.output ?? null,
           stderr: data.stderr ?? null
         });
-        setSelectedIds(prev => {
+        
+        // Clear selection for synced transactions
+        setSelectedIndices(prev => {
           const next = new Set(prev);
-          idsToSync.forEach(id => next.delete(id));
+          Array.from(prev).forEach(index => {
+            const tx = visibleTransactions[index];
+            if (tx && tx.orderId && idsToSync.includes(tx.orderId)) {
+              next.delete(index);
+            }
+          });
           return next;
         });
-        onRefresh();
+        
+        // Refresh data after a short delay to allow user to see the modal first
+        setTimeout(() => {
+          onRefresh();
+        }, 500);
       } else {
         openSyncResult({
           success: false,
           message: data.message || 'YNAB Sync fehlgeschlagen',
           summary: data.summary ?? null,
           output: data.output ?? null,
-          stderr: data.stderr ?? null
+          stderr: data.stderr ?? null,
+          configurationHelp: data.configurationHelp ?? null
         });
       }
     } catch (error) {
@@ -359,13 +450,15 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
     }
   };
 
-  const selectableTransactions = transactions.filter(t => t.orderId);
-  const unsyncedTransactions = transactions.filter(t => t.orderId && !t.ynabSynced);
-  const selectedUnsyncedIds = unsyncedTransactions
-    .map(t => t.orderId!)
-    .filter(id => selectedIds.has(id));
+  const selectableTransactions = visibleTransactions.filter(t => t.orderId);
+  const unsyncedTransactions = visibleTransactions.filter(t => t.orderId && !t.ynabSynced);
+  const selectedUnsyncedIndices = Array.from(selectedIndices)
+    .filter(index => {
+      const tx = visibleTransactions[index];
+      return tx.orderId && !tx.ynabSynced;
+    });
   const allSelected = selectableTransactions.length > 0 &&
-    selectableTransactions.every(t => t.orderId && selectedIds.has(t.orderId));
+    visibleTransactions.every((t, index) => !t.orderId || selectedIndices.has(index));
 
   const buildSummaryText = (transaction: Transaction) => {
     if (transaction.orderDescription) return transaction.orderDescription;
@@ -444,9 +537,16 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
       if (!response.ok || !data.success) {
         throw new Error(data?.error || 'Fehler beim Löschen der Transaktionen');
       }
-      setSelectedIds(prev => {
+      setSelectedIndices(prev => {
         const next = new Set(prev);
-        orderIds.forEach(id => next.delete(id));
+        // Remove deleted transaction indices
+        const deletedOrderIds = new Set(orderIds);
+        Array.from(prev).forEach(idx => {
+          const tx = visibleTransactions[idx];
+          if (tx?.orderId && deletedOrderIds.has(tx.orderId)) {
+            next.delete(idx);
+          }
+        });
         return next;
       });
       onRefresh();
@@ -509,7 +609,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
           </p>
         </div>
         <div className="list-header-actions">
-          {selectedIds.size > 0 && <span className="meta-pill">Ausgewählt: {selectedIds.size}</span>}
+          {selectedIndices.size > 0 && <span className="meta-pill">Ausgewählt: {selectedIndices.size}</span>}
           <button onClick={onRefresh} disabled={loading} className="btn-secondary">
             {loading ? 'Lade...' : 'Aktualisieren'}
           </button>
@@ -528,47 +628,76 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
           </label>
           <button
             onClick={handleSyncToYnab}
-            disabled={selectedUnsyncedIds.length === 0 || syncLoading}
+            disabled={selectedUnsyncedIndices.length === 0 || syncLoading}
             className="btn-primary"
+            style={syncLoading ? { opacity: 0.7 } : {}}
           >
-            {syncLoading ? 'Sync läuft...' : `Mit YNAB syncen (${selectedUnsyncedIds.length})`}
+            {syncLoading ? '⏳ Sync läuft...' : `Mit YNAB syncen (${selectedUnsyncedIndices.length})`}
           </button>
           <button
-            onClick={() => resetYnabStatus(Array.from(selectedIds), true)}
-            disabled={selectedIds.size === 0 || resetLoading}
+            onClick={() => resetYnabStatus(Array.from(selectedIndices).map(i => visibleTransactions[i]?.orderId).filter(Boolean) as string[], true)}
+            disabled={selectedIndices.size === 0 || resetLoading}
             className="btn-secondary"
           >
-            {resetLoading ? 'Setze zurück...' : `YNAB-Status zurücksetzen (${selectedIds.size})`}
+            {resetLoading ? 'Setze zurück...' : `YNAB-Status zurücksetzen (${selectedIndices.size})`}
           </button>
           <button
-            onClick={() => deleteTransactions(Array.from(selectedIds), true)}
-            disabled={selectedIds.size === 0 || deleteLoading}
+            onClick={() => deleteTransactions(Array.from(selectedIndices).map(i => visibleTransactions[i]?.orderId).filter(Boolean) as string[], true)}
+            disabled={selectedIndices.size === 0 || deleteLoading}
             className="btn-danger"
           >
-            {deleteLoading ? 'Lösche...' : `Ausgewählte löschen (${selectedIds.size})`}
+            {deleteLoading ? 'Lösche...' : `Ausgewählte löschen (${selectedIndices.size})`}
           </button>
+        </div>
+      )}
+
+      {syncLoading && (
+        <div style={{
+          position: 'fixed',
+          top: '50%',
+          left: '50%',
+          transform: 'translate(-50%, -50%)',
+          background: 'rgba(255, 255, 255, 0.98)',
+          padding: '32px 48px',
+          borderRadius: '16px',
+          boxShadow: '0 20px 60px rgba(0, 0, 0, 0.3)',
+          zIndex: 999,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: '16px',
+          border: '2px solid rgba(59, 130, 246, 0.3)'
+        }}>
+          <div style={{ fontSize: '48px' }}>⏳</div>
+          <div style={{ fontSize: '18px', fontWeight: 600, color: '#0f172a' }}>
+            YNAB Sync läuft...
+          </div>
+          <div style={{ fontSize: '14px', color: '#64748b' }}>
+            Bitte warten Sie, während die Transaktionen synchronisiert werden
+          </div>
         </div>
       )}
 
       <div className="transactions">
         {loading ? (
           <p>Lade Transaktionen...</p>
-        ) : transactions.length === 0 ? (
+        ) : visibleTransactions.length === 0 ? (
           <p>Keine Transaktionen gefunden. Führen Sie zuerst einen Sync durch.</p>
         ) : (
-          transactions.map((transaction, index) => {
+          visibleTransactions.map((transaction, index) => {
             // Create a truly unique key to prevent React key conflicts
             // Use orderId + index to ensure uniqueness, fallback to just index
             const key = transaction.orderId ? `${transaction.orderId}-${index}` : `idx-${index}`;
             const summaryState = summaries[key];
+
             return (
               <div key={key} className={`transaction-card ${transaction.ynabSynced ? 'is-synced' : ''}`}>
                 <div className="transaction-card__select">
                   {transaction.orderId && (
                     <input
                       type="checkbox"
-                      checked={selectedIds.has(transaction.orderId)}
-                      onChange={(e) => handleSelectTransaction(transaction.orderId!, e.target.checked)}
+                      checked={selectedIndices.has(index)}
+                      onChange={(e) => handleSelectTransaction(index, e.target.checked)}
                     />
                   )}
                 </div>
@@ -583,25 +712,86 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
                         </div>
                       )}
                     </div>
-                    <span className={`transaction-amount ${transaction.isRefund ? 'is-refund' : ''}`}>
-                      {transaction.amount}
-                    </span>
+                    <div className="transaction-amount-section">
+                      <span className={`transaction-amount ${transaction.isRefund ? 'is-refund' : ''}`}>
+                        {transaction.multiOrderTransaction && transaction.totalAmount 
+                          ? transaction.totalAmount 
+                          : transaction.amount}
+                      </span>
+                      {transaction.multiOrderTransaction && transaction.totalOrders && (
+                        <span className="multi-order-badge">
+                          Teil {(transaction.orderIndex ?? 0) + 1}/{transaction.totalOrders}
+                        </span>
+                      )}
+                    </div>
                   </div>
 
                   <div className="transaction-card__body">
                     <span className="transaction-merchant">{transaction.merchant || 'Unbekannt'}</span>
                     {transaction.orderItems && transaction.orderItems.length > 0 ? (
-                      <ol className="description-list">
-                        {transaction.orderItems.slice(0, 5).map((item, idx) => (
-                          <li key={`${transaction.orderId ?? 'order'}-${idx}`}>
-                            <span className="item-title">{item.title}</span>
-                            {item.price && <span className="item-price">{item.price}</span>}
-                          </li>
-                        ))}
-                        {transaction.orderItems.length > 5 && (
-                          <li className="item-more">+{transaction.orderItems.length - 5} weitere Artikel</li>
+                      <>
+                        <ol className="description-list">
+                          {transaction.orderItems.slice(0, 5).map((item, idx) => (
+                            <li key={`${transaction.orderId ?? 'order'}-${idx}`}>
+                              <span className="item-title">
+                                {item.quantity && item.quantity > 1 ? `${item.quantity}x ` : ''}{item.title}
+                              </span>
+                              {item.price && <span className="item-price">{item.price}</span>}
+                            </li>
+                          ))}
+                          {transaction.orderItems.length > 5 && (
+                            <li className="item-more">+{transaction.orderItems.length - 5} weitere Artikel</li>
+                          )}
+                        </ol>
+                        {transaction.orderSummary && (
+                          <div className="order-summary">
+                            {transaction.orderSummary.subtotal && (
+                              <div className="summary-item subtotal">
+                                <span className="summary-label">Zwischensumme:</span>
+                                <span className="summary-value">{transaction.orderSummary.subtotal}€</span>
+                              </div>
+                            )}
+                            {transaction.orderSummary.voucher && (
+                              <div className="summary-item voucher">
+                                <span className="summary-label">Gutschein:</span>
+                                <span className="summary-value">{transaction.orderSummary.voucher}</span>
+                              </div>
+                            )}
+                            {transaction.orderSummary.bonusPoints && (
+                              <div className="summary-item bonus-points">
+                                <span className="summary-label">Prämienpunkte:</span>
+                                <span className="summary-value">{transaction.orderSummary.bonusPoints}</span>
+                              </div>
+                            )}
+                            {transaction.orderSummary.shipping && (
+                              <div className="summary-item shipping">
+                                <span className="summary-label">Versand:</span>
+                                <span className="summary-value">{transaction.orderSummary.shipping}€</span>
+                              </div>
+                            )}
+                            {transaction.orderSummary.total && (
+                              <div className="summary-item total">
+                                <span className="summary-label">Gesamt:</span>
+                                <span className="summary-value total-value">{transaction.orderSummary.total}€</span>
+                              </div>
+                            )}
+                            {/* Show warning for partial refunds where amount doesn't match total */}
+                            {transaction.isRefund && transaction.amount && transaction.orderSummary.total && (
+                              (() => {
+                                const amountValue = parseFloat(transaction.amount.replace(/[^0-9.,]/g, '').replace(',', '.'));
+                                const totalValue = parseFloat(transaction.orderSummary.total.replace(',', '.'));
+                                return Math.abs(amountValue - totalValue) > 0.01 && (
+                                  <div className="summary-item info">
+                                    <span className="summary-note">
+                                      ℹ️ Teilerstattung: Tatsächlicher Betrag {transaction.amount}
+                                    </span>
+                                  </div>
+                                );
+                              })()
+                            )}
+                          </div>
                         )}
-                      </ol>
+                      </>
                     ) : (
                       transaction.orderDescription && (
                         <span className="transaction-description">{transaction.orderDescription}</span>
@@ -611,7 +801,17 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
 
                   <div className="transaction-card__footer">
                     <div className="transaction-meta">
-                      {transaction.orderId && <span className="meta-pill">Order {transaction.orderId}</span>}
+                      {transaction.orderId && (
+                        <a 
+                          href={transaction.orderUrl || `https://www.amazon.de/gp/css/summary/edit.html?orderID=${transaction.orderId}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="meta-pill order-link"
+                          title="Bestellung bei Amazon öffnen"
+                        >
+                          Order {transaction.orderId}
+                        </a>
+                      )}
                       {transaction.ynabSync?.importId && (
                         <span className="meta-pill muted">Import {transaction.ynabSync.importId}</span>
                       )}

@@ -13,8 +13,19 @@ export interface Transaction {
   isRefund: boolean;
   orderDescription: string | null;
   orderTitles?: string[] | null;
-  orderItems?: { title: string; price?: string | null }[] | null;
+  orderItems?: { title: string; price?: string | null; quantity?: number }[] | null;
+  orderSummary?: {
+    subtotal?: string | null;
+    voucher?: string | null;
+    bonusPoints?: string | null;
+    shipping?: string | null;
+    total?: string | null;
+  } | null;
   aiSummary?: string | null;
+  multiOrderTransaction?: boolean;
+  totalAmount?: string | null;
+  orderIndex?: number;
+  totalOrders?: number;
   ynabSynced?: boolean;
   ynabSync?: {
     at?: string;

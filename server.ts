@@ -1,13 +1,42 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import { promises as fs } from 'fs';
 import path from 'path';
 import OpenAI from 'openai';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Check if Playwright is properly installed
+async function checkPlaywrightInstallation(): Promise<void> {
+  try {
+    // Try to get Playwright executable path
+    const result = execSync('npx playwright --version', { encoding: 'utf8' });
+    console.log('✅ Playwright gefunden:', result.trim());
+    
+    // Check if chromium is installed
+    try {
+      const chromiumCheck = execSync('npx playwright install --dry-run chromium 2>&1', { encoding: 'utf8' });
+      if (chromiumCheck.includes('is already installed')) {
+        console.log('✅ Chromium Browser ist installiert');
+      } else {
+        console.warn('⚠️  Chromium Browser fehlt. Installiere...');
+        execSync('npx playwright install chromium', { stdio: 'inherit' });
+        console.log('✅ Chromium Browser erfolgreich installiert');
+      }
+    } catch (error) {
+      console.warn('⚠️  Chromium Browser wird installiert...');
+      execSync('npx playwright install chromium', { stdio: 'inherit' });
+      console.log('✅ Chromium Browser erfolgreich installiert');
+    }
+  } catch (error) {
+    console.error('❌ Playwright ist nicht korrekt installiert.');
+    console.error('Bitte führe aus: npm install && npx playwright install chromium');
+    process.exit(1);
+  }
+}
 
 // Middleware
 app.use(cors());
@@ -16,6 +45,12 @@ app.use(express.json());
 // Root route for debugging
 app.get('/', (req, res) => {
   res.json({ message: 'Amazon to YNAB Sync API Server is running' });
+});
+
+// Check YNAB configuration status
+app.get('/api/ynab-config', (req, res) => {
+  const config = checkYnabConfig();
+  res.json(config);
 });
 
 // Types
@@ -69,6 +104,19 @@ const syncState: SyncStatus = {
 };
 
 const openaiApiKey = process.env.OPENAI_API_KEY;
+
+// Check YNAB configuration
+function checkYnabConfig(): { configured: boolean; missing: string[] } {
+  const missing: string[] = [];
+  
+  if (!process.env.YNAB_TOKEN) missing.push('YNAB_TOKEN');
+  if (!process.env.YNAB_ACCOUNT_ID) missing.push('YNAB_ACCOUNT_ID');
+  
+  return {
+    configured: missing.length === 0,
+    missing
+  };
+}
 const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
 
 const SUMMARY_MAX_LENGTH = 120;
@@ -214,7 +262,8 @@ function runScript(scriptPath: string, args: string[] = []): Promise<ScriptResul
     const child = spawn('npx', ['ts-node', scriptPath, ...args], {
       cwd: process.cwd(),
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32'
+      shell: process.platform === 'win32',
+      env: process.env  // Pass environment variables to child process
     });
 
     const stdoutChunks: string[] = [];
@@ -424,7 +473,41 @@ app.get('/api/check-login', async (req, res) => {
     const content = await fs.readFile(storagePath, 'utf-8');
     JSON.parse(content); // Check if valid JSON
 
-    res.json({ valid: true, message: 'Login-State ist gültig' });
+    // Actually test the session by trying to access Amazon
+    const playwright = await import('playwright');
+    const browser = await playwright.chromium.launch({ headless: true });
+    const context = await browser.newContext({ storageState: storagePath });
+    const page = await context.newPage();
+    
+    try {
+      // Try to access the transactions page
+      await page.goto('https://www.amazon.de/cpe/yourpayments/transactions', { 
+        waitUntil: 'domcontentloaded',
+        timeout: 10000 
+      });
+      
+      // Check if we're redirected to login page
+      const url = page.url();
+      const title = await page.title();
+      
+      if (url.includes('/ap/signin') || title.includes('Anmeld')) {
+        await browser.close();
+        return res.json({ valid: false, message: 'Amazon-Session abgelaufen (Redirect zu Login)' });
+      }
+      
+      // Check if we can see transactions
+      const hasTransactions = await page.$('.payWalletContentContainer, [data-testid*="transaction"]').catch(() => null);
+      await browser.close();
+      
+      if (!hasTransactions) {
+        return res.json({ valid: false, message: 'Amazon-Session möglicherweise abgelaufen' });
+      }
+      
+      res.json({ valid: true, message: 'Login-State ist gültig' });
+    } catch (error) {
+      await browser.close();
+      throw error;
+    }
   } catch (error) {
     res.json({ valid: false, message: 'Login-State ist ungültig oder beschädigt' });
   }
@@ -708,6 +791,26 @@ app.get('/api/transactions', async (req, res) => {
 // Sync selected transactions to YNAB
 app.post('/api/sync-ynab', async (req, res) => {
   try {
+    // Check YNAB configuration first
+    const ynabConfig = checkYnabConfig();
+    if (!ynabConfig.configured) {
+      return res.status(400).json({
+        success: false,
+        error: 'YNAB nicht konfiguriert',
+        message: `Fehlende Konfiguration: ${ynabConfig.missing.join(', ')}. Bitte erstelle eine .env Datei mit YNAB_TOKEN und YNAB_ACCOUNT_ID.`,
+        configurationHelp: {
+          missing: ynabConfig.missing,
+          instructions: [
+            '1. Kopiere .env.example zu .env',
+            '2. Hole deinen YNAB Personal Access Token von: https://app.youneedabudget.com/settings/developer',
+            '3. Finde deine YNAB Account ID in der YNAB URL oder über die API',
+            '4. Trage beide Werte in die .env Datei ein',
+            '5. Starte den Server neu'
+          ]
+        }
+      });
+    }
+
     const { transactionIds }: { transactionIds: string[] } = req.body;
 
     if (!transactionIds || !Array.isArray(transactionIds)) {
@@ -793,6 +896,16 @@ app.post('/api/sync-ynab', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server läuft auf Port ${PORT}`);
+// Start server with Playwright check
+async function startServer() {
+  await checkPlaywrightInstallation();
+  
+  app.listen(PORT, () => {
+    console.log(`Server läuft auf Port ${PORT}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error('Fehler beim Starten des Servers:', error);
+  process.exit(1);
 });

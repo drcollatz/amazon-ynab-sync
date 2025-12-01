@@ -633,6 +633,19 @@
   color: #0369a1;
 }
 
+.badge-warning {
+  background: rgba(251, 191, 36, 0.25);
+  color: #d97706;
+  font-weight: 500;
+}
+
+.transaction-amount-section {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
 .transaction-amount {
   font-size: 1.35rem;
   font-weight: 600;
@@ -641,6 +654,16 @@
 
 .transaction-amount.is-refund {
   color: #059669;
+}
+
+.santander-punkte-info {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #d97706;
+  background: rgba(251, 191, 36, 0.15);
+  padding: 2px 8px;
+  border-radius: 8px;
+  white-space: nowrap;
 }
 
 .transaction-card__body {
@@ -689,6 +712,86 @@
   color: #94a3b8;
 }
 
+.order-summary {
+  margin-top: 12px;
+  padding: 12px;
+  background: rgba(249, 115, 22, 0.05);
+  border-left: 3px solid rgba(249, 115, 22, 0.3);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.summary-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.9rem;
+  padding: 4px 0;
+}
+
+.summary-item.subtotal {
+  border-bottom: 1px solid rgba(100, 116, 139, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+}
+
+.summary-item.total {
+  border-top: 2px solid rgba(100, 116, 139, 0.3);
+  padding-top: 8px;
+  margin-top: 4px;
+  font-weight: 700;
+}
+
+.summary-label {
+  font-weight: 500;
+  color: #64748b;
+}
+
+.summary-value {
+  font-weight: 600;
+  color: #059669;
+}
+
+.summary-item.subtotal .summary-value {
+  color: #334155;
+}
+
+.summary-item.voucher .summary-value {
+  color: #0891b2;
+}
+
+.summary-item.bonus-points .summary-value {
+  color: #d97706;
+}
+
+.summary-item.shipping .summary-value {
+  color: #64748b;
+}
+
+.summary-item.total .summary-value {
+  color: #059669;
+  font-size: 1.05rem;
+}
+
+.summary-item.info {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+.summary-note {
+  display: block;
+  font-size: 0.85rem;
+  color: #2563eb;
+  font-style: italic;
+  background: rgba(59, 130, 246, 0.1);
+  padding: 6px 10px;
+  border-radius: 4px;
+  border-left: 3px solid #2563eb;
+}
+
 .transaction-card__footer {
   display: flex;
   flex-wrap: wrap;
@@ -712,11 +815,40 @@
   font-size: 0.8rem;
   background: rgba(148, 163, 184, 0.2);
   color: #475569;
+  text-decoration: none;
+  transition: all 0.2s ease;
+}
+
+.meta-pill.order-link {
+  cursor: pointer;
+  background: rgba(249, 115, 22, 0.15);
+  color: #ea580c;
+  font-weight: 500;
+}
+
+.meta-pill.order-link:hover {
+  background: rgba(249, 115, 22, 0.25);
+  color: #c2410c;
+  transform: translateY(-1px);
+}
 }
 
 .meta-pill.muted {
   background: rgba(148, 163, 184, 0.12);
   color: #64748b;
+}
+
+.multi-order-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  margin-left: 6px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  background: rgba(59, 130, 246, 0.15);
+  color: #2563eb;
+  border: 1px solid rgba(59, 130, 246, 0.3);
 }
 
 .transaction-actions {
@@ -883,6 +1015,97 @@
 .modal-timestamp {
   font-size: 0.9rem;
   color: #64748b;
+}
+
+.config-help {
+  margin-top: 20px;
+  padding: 20px;
+  background: rgba(59, 130, 246, 0.05);
+  border-radius: 12px;
+  border: 2px solid rgba(59, 130, 246, 0.2);
+}
+
+.config-help h4 {
+  margin: 16px 0 8px 0;
+  color: #1e40af;
+  font-size: 1.1rem;
+}
+
+.config-help h4:first-child {
+  margin-top: 0;
+}
+
+.config-help h5 {
+  margin: 12px 0 6px 0;
+  color: #475569;
+  font-size: 0.95rem;
+}
+
+.missing-config-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.missing-config-list li {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.missing-config-list code {
+  color: #dc2626;
+  font-weight: 600;
+  font-family: 'Courier New', monospace;
+}
+
+.config-instructions {
+  margin: 8px 0;
+  padding-left: 24px;
+  color: #334155;
+  line-height: 1.8;
+}
+
+.config-instructions li {
+  margin: 6px 0;
+}
+
+.config-example {
+  margin-top: 16px;
+  padding: 16px;
+  background: rgba(15, 23, 42, 0.05);
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.config-example pre {
+  margin: 8px 0 0 0;
+  padding: 12px;
+  background: #1e293b;
+  color: #e2e8f0;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+.config-links {
+  margin-top: 20px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.config-links .btn-primary {
+  flex: 1;
+  min-width: 200px;
+  text-align: center;
+  text-decoration: none;
 }
 
 .summary-section {

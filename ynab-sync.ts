@@ -377,12 +377,27 @@ const summary: SyncSummary = {
       });
     }
 
+    // Group transactions by orderId to identify Santander-Punkte companions
+    const transactionsByOrderId = new Map<string, Array<{ transaction: ParsedTransaction; index: number }>>();
+    
+    transactions.forEach((transaction, index) => {
+      const orderId = typeof transaction.orderId === "string" ? transaction.orderId.trim() : null;
+      if (orderId) {
+        if (!transactionsByOrderId.has(orderId)) {
+          transactionsByOrderId.set(orderId, []);
+        }
+        transactionsByOrderId.get(orderId)!.push({ transaction, index });
+      }
+    });
+
     const candidates: CandidateRecord[] = [];
     const retrySeed = Date.now();
+    const santanderPunkteIndices = new Set<number>(); // Track which indices are Santander-Punkte transactions
 
     transactions.forEach((transaction, index) => {
       const orderId = typeof transaction.orderId === "string" ? transaction.orderId.trim() : null;
       const sampleId = orderId || `index-${index}`;
+      const isSantanderPunkte = transaction.paymentInstrument?.includes('Santander-Punkte') ?? false;
 
       if (orderId) {
         summary.totals.withOrderId += 1;
@@ -418,6 +433,27 @@ const summary: SyncSummary = {
         return;
       }
 
+      // Skip Santander-Punkte transactions - they will be added to main transaction memo
+      if (isSantanderPunkte) {
+        santanderPunkteIndices.add(index);
+        logInfo(`Überspringe Santander-Punkte Transaktion: ${sampleId} (${transaction.amount})`);
+        return;
+      }
+
+      // Skip secondary multi-order transactions - only sync the primary one (orderIndex === 0)
+      const isMultiOrder = (transaction as any).multiOrderTransaction === true;
+      const orderIndex = (transaction as any).orderIndex;
+      if (isMultiOrder && orderIndex !== 0) {
+        logInfo(`Überspringe sekundäre Multi-Order Transaktion: ${sampleId} (Teil ${orderIndex + 1})`);
+        if (orderId && selectionStatusMap?.has(orderId)) {
+          selectionStatusMap.set(orderId, { 
+            status: "already-synced", 
+            detail: "Teil einer Multi-Order-Transaktion (nicht primär)" 
+          });
+        }
+        return;
+      }
+
       const record: CandidateRecord = { ...transaction, __index: index, isoDate };
       candidates.push(record);
 
@@ -429,7 +465,11 @@ const summary: SyncSummary = {
     summary.candidates.count = candidates.length;
 
     const prepared = candidates.map((candidate) => {
-      const amountMilli = amountToMilliunits(candidate.amount, !!candidate.isRefund);
+      // For multi-order transactions, use totalAmount instead of amount
+      const isMultiOrder = (candidate as any).multiOrderTransaction === true;
+      const amountStr = isMultiOrder ? ((candidate as any).totalAmount || candidate.amount) : candidate.amount;
+      
+      const amountMilli = amountToMilliunits(amountStr, !!candidate.isRefund);
       summary.candidates.totalAmountMilliunits += amountMilli;
       if (candidate.isRefund) {
         summary.candidates.refunds += 1;
@@ -447,14 +487,63 @@ const summary: SyncSummary = {
         }
       }
 
+      // Build memo with Santander-Punkte info if applicable
+      let memo = candidate.aiSummary ||
+        (candidate.orderDescription ? candidate.orderDescription.slice(0, 200) : "");
+      
+      // Check if there's a Santander-Punkte transaction for the same order
+      const orderId = typeof candidate.orderId === "string" ? candidate.orderId.trim() : null;
+      
+      // For multi-order transactions, append details about all orders
+      const multiOrderFlag = (candidate as any).multiOrderTransaction === true;
+      const totalOrders = (candidate as any).totalOrders;
+      if (multiOrderFlag && totalOrders && totalOrders > 1 && orderId) {
+        // Find all related orders from the same date
+        const relatedOrders = transactions.filter((t: any) => 
+          t.multiOrderTransaction === true && 
+          t.date === candidate.date &&
+          t.totalAmount === (candidate as any).totalAmount
+        );
+        
+        if (relatedOrders.length > 1) {
+          const orderSummaries = relatedOrders
+            .sort((a: any, b: any) => (a.orderIndex || 0) - (b.orderIndex || 0))
+            .map((order: any, idx: number) => {
+              const orderTotal = order.orderSummary?.total || "?";
+              const firstItem = order.orderItems?.[0]?.title || order.orderId || "Unbekannt";
+              const itemPreview = firstItem.length > 40 ? firstItem.slice(0, 40) + "..." : firstItem;
+              return `[${idx + 1}] ${itemPreview} (${orderTotal}€)`;
+            })
+            .join(" | ");
+          
+          memo = `Multi-Order: ${orderSummaries}`;
+        }
+      }
+      
+      if (orderId && transactionsByOrderId.has(orderId)) {
+        const relatedTransactions = transactionsByOrderId.get(orderId)!;
+        const santanderTransaction = relatedTransactions.find(
+          rt => rt.transaction.paymentInstrument?.includes('Santander-Punkte')
+        );
+        
+        if (santanderTransaction) {
+          const punkteAmount = santanderTransaction.transaction.amount || "0";
+          // Append Santander-Punkte info to memo
+          const punkteInfo = ` [Santander-Punkte: ${punkteAmount}]`;
+          const maxMemoLength = 200 - punkteInfo.length;
+          if (memo.length > maxMemoLength) {
+            memo = memo.slice(0, maxMemoLength);
+          }
+          memo += punkteInfo;
+        }
+      }
+
       const payload: YnabSyncPayload = {
         account_id: YNAB_ACCOUNT_ID,
         date: candidate.isoDate,
         amount: amountMilli,
         payee_name: candidate.merchant || "Amazon",
-        memo:
-          candidate.aiSummary ||
-          (candidate.orderDescription ? candidate.orderDescription.slice(0, 200) : ""),
+        memo,
         cleared: "cleared",
         approved: false,
         import_id: importId,
@@ -539,6 +628,27 @@ const summary: SyncSummary = {
             status: "queued",
             detail: "missing-ynab-transaction-id",
           });
+        }
+      }
+      
+      // Also mark Santander-Punkte companion transactions as synced (attached to main transaction)
+      if (orderId && transactionsByOrderId.has(orderId)) {
+        const relatedTransactions = transactionsByOrderId.get(orderId)!;
+        const santanderTransaction = relatedTransactions.find(
+          rt => rt.transaction.paymentInstrument?.includes('Santander-Punkte')
+        );
+        
+        if (santanderTransaction) {
+          const santanderIdx = santanderTransaction.index;
+          parsed.transactions[santanderIdx].ynabSynced = true;
+          parsed.transactions[santanderIdx].ynabSync = {
+            at: new Date().toISOString(),
+            importId: `${item.importId}:punkte`,
+            ynabTransactionId: matchedId, // Same as main transaction
+            duplicateImportId: false,
+            amountMilliunits: amountToMilliunits(santanderTransaction.transaction.amount, false),
+          };
+          logInfo(`Santander-Punkte als Teil der Haupttransaktion markiert: ${orderId}`);
         }
       }
     }

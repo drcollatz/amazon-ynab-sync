@@ -15,12 +15,26 @@ type Transaction = {
   orderDescription: string | null;          // all titles joined with " · "
   orderTitles?: string[] | null;            // optional separate titles
   orderItems?: OrderItem[] | null;          // structured items used for formatted description
+  orderSummary?: OrderSummary | null;       // order totals, discounts, etc.
   aiSummary?: string | null;                // AI-generated summary for YNAB memo
+  multiOrderTransaction?: boolean;          // true if this is one of multiple orders in a single transaction
+  totalAmount?: string | null;              // total amount across all orders (for multi-order transactions)
+  orderIndex?: number;                      // index of this order in multi-order transaction (0-based)
+  totalOrders?: number;                     // total number of orders in multi-order transaction
 };
 
 type OrderItem = {
   title: string;
   price?: string | null;
+  quantity?: number;
+};
+
+type OrderSummary = {
+  subtotal?: string | null;
+  voucher?: string | null;
+  bonusPoints?: string | null;
+  shipping?: string | null;
+  total?: string | null;
 };
 
 type SyncMode = 'current-month' | 'last-n' | 'date-range';
@@ -424,95 +438,124 @@ async function extractTransactions(page: Page, options: CliOptions): Promise<Tra
       console.log(`[TRANSACTION] Analyzing ${elements.length} elements with selector: ${selector}`);
       
       elements.forEach((el, idx) => {
-        const links = el.querySelectorAll('a[href]');
-        console.log(`[TRANSACTION] Element ${idx + 1} has ${links.length} transaction links`);
+        const links = el.querySelectorAll('a[href*="#"]'); // Filter for transaction links
+        console.log(`[TRANSACTION] Element ${idx + 1} has ${links.length} potential transaction links`);
         
         links.forEach((link) => {
           const text = (link.textContent || "").trim();
           const href = (link as HTMLAnchorElement).href;
-          if (text && href) {
-            console.log(`[TRANSACTION] Found transaction link: "${text}"`);
+          // Only include links that look like transaction entries
+          if (text && href && text.includes('Bestellnummer')) {
+            console.log(`[TRANSACTION] Found transaction link: "${text.substring(0, 100)}..."`);
             results.push({text, href});
           }
         });
       });
       
+      console.log(`[TRANSACTION] Filtered to ${results.length} transaction links`);
       return results;
     }, foundSelector);
     
-    console.log(`[TRANSACTION] Found ${linkTexts.length} total links to process`);
+    console.log(`[TRANSACTION] Found ${linkTexts.length} total transaction links to process`);
     
     for (let i = 0; i < linkTexts.length; i++) {
       const {text: linkText, href: linkHref} = linkTexts[i];
-      console.log(`[TRANSACTION] Processing link ${i + 1}: "${linkText}"`);
+      console.log(`\n[TRANSACTION ${i + 1}/${linkTexts.length}] Raw text: "${linkText}"`);
       
-      if (linkText && linkHref) {
-        // Check if this looks like a transaction
-        if (linkText.includes('Bestellnummer') && (linkText.includes('€') || /\d{1,2}\.\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i.test(linkText))) {
-          console.log(`[TRANSACTION] Transaction detected, parsing...`);
-          
-          // Extract order ID
-          const orderIdMatch = linkText.match(/Bestellnummer\s+([0-9-]+)/);
-          const orderId = orderIdMatch ? orderIdMatch[1].replace(/-$/, '') : null;
-          
-          // Extract amount
-          const amountMatch = linkText.match(/([+-]?€\d+[.,]\d{2})/);
-          const amount = amountMatch ? amountMatch[1] : null;
-          
-          // Extract date
-          const dateMatch = linkText.match(/(\d{1,2}\.\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{4})/i);
-          const date = dateMatch ? dateMatch[1] : null;
-          
-          // Extract merchant - improve parsing logic
-          let merchant = null;
-          if (date) {
-            // Look for merchant between date and payment instrument
-            const afterDate = linkText.substring(linkText.indexOf(date) + date.length);
-            // Pattern: Date · Merchant · PaymentInstrument
-            const merchantMatch = afterDate.match(/·([^·]+)·/);
-            if (merchantMatch) {
-              merchant = merchantMatch[1].trim();
-            } else {
-              // Fallback: look for any text after date that's not the payment instrument
-              const parts = afterDate.split('·');
-              if (parts.length > 1) {
-                merchant = parts[0].trim();
-              }
-            }
+      if (!linkText || !linkHref) {
+        console.log(`[TRANSACTION ${i + 1}] Skipped - missing text or href`);
+        continue;
+      }
+      
+      // Extract order ID - support multiple order IDs in one transaction
+      const orderIdMatches = Array.from(linkText.matchAll(/Bestellnummer\s+([0-9-]+)/g));
+      if (orderIdMatches.length === 0) {
+        console.log(`[TRANSACTION ${i + 1}] Skipped - no order number found`);
+        continue;
+      }
+      
+      // Clean up all order IDs - remove trailing dashes
+      const orderIds = orderIdMatches.map(m => m[1].replace(/-+$/, ''));
+      const hasMultipleOrders = orderIds.length > 1;
+      
+      if (hasMultipleOrders) {
+        console.log(`[TRANSACTION ${i + 1}] Multiple Order IDs found: ${orderIds.join(', ')}`);
+      } else {
+        console.log(`[TRANSACTION ${i + 1}] Order ID: ${orderIds[0]} (raw: ${orderIdMatches[0][1]})`);
+      }
+      
+      // Extract date - German format: "27. November 2025"
+      const dateMatch = linkText.match(/(\d{1,2}\.\s*(Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)\s+\d{4})/i);
+      const date = dateMatch ? dateMatch[1] : null;
+      console.log(`[TRANSACTION ${i + 1}] Date: ${date || 'NOT FOUND'}`);
+      
+      // Extract amount - with support for + (refund) and - (charge)
+      const amountMatch = linkText.match(/([+-]?€\d+[.,]\d{2})/);
+      const amount = amountMatch ? amountMatch[1] : null;
+      console.log(`[TRANSACTION ${i + 1}] Amount: ${amount || 'NOT FOUND'}`);
+      
+      // Check if it's a refund
+      const isRefund = linkText.includes('Erstattet') || (amount?.startsWith('+') ?? false);
+      console.log(`[TRANSACTION ${i + 1}] Is Refund: ${isRefund}`);
+      
+      // Extract merchant - text between date and payment instrument
+      let merchant = null;
+      if (date) {
+        const afterDate = linkText.substring(linkText.indexOf(date) + date.length);
+        // Split by · and get the first part (usually the merchant)
+        const parts = afterDate.split('·').map(p => p.trim()).filter(p => p);
+        if (parts.length > 0) {
+          // First part should be merchant
+          merchant = parts[0];
+          // Clean up merchant name
+          if (merchant.match(/^(AMAZON|AMZN|Amazon\.de|WWW\.AMAZON\.DE)/i)) {
+            merchant = merchant.split(/\s+/)[0]; // Take just the first word
           }
-          
-          // Extract payment instrument
-          const cardMatch = linkText.match(/(Amazon Visa|Santander-Punkte|AMAZON|AMZN)/);
-          const paymentInstrument = cardMatch ? cardMatch[1] : null;
-          
-          // Check if it's a refund
-          const isRefund = linkText.includes('Erstattet') || amountMatch?.[1]?.startsWith('+');
-          
-          // Create transaction object
-          if (date || amount || orderId) {
-            // Generate proper order details URL since linkHref points to transaction page
-            const orderUrl = orderId ? `https://www.amazon.de/gp/css/summary/edit.html?orderID=${orderId}` : linkHref;
-            
-            const transaction = {
-              date,
-              amount,
-              paymentInstrument,
-              merchant,
-              orderId,
-              orderUrl,
-              isRefund,
-              orderDescription: null,
-              orderItems: null
-            };
-            
-            txs.push(transaction);
-            console.log(`[TRANSACTION] Added: ${orderId || 'no-id'} - ${amount} - ${merchant || 'no-merchant'}`);
-          } else {
-            console.log(`[TRANSACTION] Skipped - insufficient data`);
-          }
-        } else {
-          console.log(`[TRANSACTION] Skipped - not a transaction link`);
         }
+      }
+      console.log(`[TRANSACTION ${i + 1}] Merchant: ${merchant || 'NOT FOUND'}`);
+      
+      // Extract payment instrument
+      const cardMatch = linkText.match(/(Amazon Visa[^·]*|Santander-Punkte|Mastercard|Visa|American Express)/i);
+      const paymentInstrument = cardMatch ? cardMatch[1].trim() : null;
+      console.log(`[TRANSACTION ${i + 1}] Payment: ${paymentInstrument || 'NOT FOUND'}`);
+      
+      // Create transaction object(s) - one per order ID if multiple
+      if (date || amount) {
+        // For multi-order transactions, create one entry per order ID
+        for (let j = 0; j < orderIds.length; j++) {
+          const orderId = orderIds[j];
+          const orderUrl = orderId ? `https://www.amazon.de/gp/css/summary/edit.html?orderID=${orderId}` : linkHref;
+          
+          const transaction = {
+            date,
+            amount: hasMultipleOrders ? null : amount, // Only include amount for single-order transactions
+            paymentInstrument,
+            merchant,
+            orderId,
+            orderUrl,
+            isRefund,
+            orderDescription: null,
+            orderItems: null,
+            ...(hasMultipleOrders ? { 
+              multiOrderTransaction: true,
+              totalAmount: amount,
+              orderIndex: j,
+              totalOrders: orderIds.length 
+            } : {})
+          };
+          
+          txs.push(transaction);
+          if (hasMultipleOrders) {
+            console.log(`[TRANSACTION ${i + 1}.${j + 1}] ✅ ADDED (Order ${j + 1}/${orderIds.length}: ${orderId})`);
+          }
+        }
+        
+        if (!hasMultipleOrders) {
+          console.log(`[TRANSACTION ${i + 1}] ✅ ADDED`);
+        }
+      } else {
+        console.log(`[TRANSACTION ${i + 1}] ❌ SKIPPED - missing both date and amount`);
       }
     }
     
@@ -522,8 +565,11 @@ async function extractTransactions(page: Page, options: CliOptions): Promise<Tra
     txs = [];
   }
 
-  // Filter out Amazon Punkte Punkte transactions as per user request
-  const filtered = txs.filter((t: any) => t.paymentInstrument !== "Amazon Punkte Punkte");
+  // Filter out Amazon Punkte Punkte and Santander-Punkte transactions (they are included in orderSummary)
+  const filtered = txs.filter((t: any) => 
+    t.paymentInstrument !== "Amazon Punkte Punkte" && 
+    t.paymentInstrument !== "Santander-Punkte"
+  );
   const byMode = applySyncFilters(filtered, options);
   console.log(`   Gefundene Transaktionen gesamt: ${txs.length}, gefiltert: ${filtered.length}, nach Modus (${options.mode}): ${byMode.length}`);
   console.timeEnd("phase:extractTransactions");
@@ -533,6 +579,7 @@ async function extractTransactions(page: Page, options: CliOptions): Promise<Tra
 type OrderDetailResult = {
   titles: string[] | null;
   items: OrderItem[] | null;
+  summary: OrderSummary | null;
 };
 
 /** Fetch product titles from order detail page (strictly scoped to #orderDetails) */
@@ -563,7 +610,10 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
     /(^Anmelden\b|Anmelden\s*·\s*Amazon)/i.test(title) ||
     !hasOrderDetails
   ) {
-    console.warn(`   Kein Zugriff auf Bestelldetails für ${orderId} (Login/Redirect oder fehlendes #orderDetails). URL=${currentUrl} TITLE=${title}`);
+    console.warn(`   ⚠️  Kein Zugriff auf Bestelldetails für ${orderId} (Login/Redirect oder fehlendes #orderDetails).`);
+    console.warn(`   URL: ${currentUrl}`);
+    console.warn(`   TITLE: ${title}`);
+    console.warn(`   HINWEIS: Die Amazon-Session ist möglicherweise abgelaufen. Führe 'npm run login' erneut aus.`);
     console.timeEnd(label);
     return null;
   }
@@ -573,9 +623,18 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
   type RawItem = {
     title: string | null;
     price: string | null;
+    quantity?: number;
   };
 
-  const { titles, items: rawItems, debugSelectors, foundRoot, rootSnippet } = await page.evaluate(() => {
+  type RawSummary = {
+    subtotal?: string | null;
+    voucher?: string | null;
+    bonusPoints?: string | null;
+    shipping?: string | null;
+    total?: string | null;
+  };
+
+  const { titles, items: rawItems, summary: rawSummary, debugSelectors, foundRoot, rootSnippet } = await page.evaluate(() => {
     const sanitize = (t?: string | null) => (t ?? "").replace(/\s+/g, " ").trim() || null;
 
     const rootSelectors = [
@@ -604,7 +663,7 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
     const seen = new Set<string>();
     const titles: string[] = [];
     const items: RawItem[] = [];
-    const debugSelectors: { selector: string; hits: number }[] = [];
+    const debugSelectors: { selector: string; hits: number; qtyDivs?: number; quantities?: string }[] = [];
 
     const pushTitle = (raw: string | null | undefined) => {
       const clean = sanitize(raw);
@@ -621,12 +680,19 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
     const rootsToUse = roots.length ? roots : [document.body];
 
     let purchasedHits = 0;
+    const qtyMap = new Map<number, number>(); // Track quantities by item index
+    
     for (const root of rootsToUse) {
       const purchasedSections = Array.from(root.querySelectorAll('[data-component="purchasedItems"]'));
       if (!purchasedSections.length) continue;
+      
+      // First, collect all quantity indicators
+      const allQtyDivs = Array.from(root.querySelectorAll('.od-item-view-qty span'));
+      
       for (const section of purchasedSections) {
         const itemBlocks = Array.from(section.querySelectorAll('[data-component="purchasedItemsRightGrid"]'));
-        for (const block of itemBlocks) {
+        for (let idx = 0; idx < itemBlocks.length; idx++) {
+          const block = itemBlocks[idx];
           const titleNode = block.querySelector('[data-component="itemTitle"] a');
           const priceNode = block.querySelector('[data-component="unitPrice"] .a-price');
           const titleText = sanitize(titleNode?.textContent);
@@ -638,12 +704,34 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
             const offscreen = priceNode.querySelector('.a-offscreen');
             priceText = sanitize(hidden?.textContent) || sanitize(offscreen?.textContent) || sanitize(priceNode.textContent);
           }
-          items.push({ title: titleText, price: priceText });
+          
+          // Look for quantity - use the corresponding qty div by index
+          let quantity = 1;
+          if (allQtyDivs[idx]) {
+            const qtyText = sanitize(allQtyDivs[idx].textContent);
+            const qtyNum = parseInt(qtyText || '1', 10);
+            if (!isNaN(qtyNum) && qtyNum > 0) {
+              quantity = qtyNum;
+              qtyMap.set(idx, quantity);
+            }
+          }
+          
+          // Add the item 'quantity' times to simulate multiple occurrences
+          for (let i = 0; i < quantity; i++) {
+            items.push({ title: titleText, price: priceText });
+          }
           purchasedHits++;
         }
       }
       if (purchasedHits > 0) {
-        debugSelectors.push({ selector: 'purchasedItems', hits: purchasedHits });
+        const qtyInfo = Array.from(qtyMap.entries()).map(([i, q]) => `${i}:${q}x`).join(',');
+        const qtyDebugInfo = `found ${allQtyDivs.length} qty divs`;
+        debugSelectors.push({ 
+          selector: 'purchasedItems', 
+          hits: purchasedHits,
+          qtyDivs: allQtyDivs.length,
+          ...(qtyInfo ? { quantities: qtyInfo } : {})
+        });
         break; // stop after first root with real purchased items
       }
     }
@@ -669,26 +757,85 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
     const firstRoot = rootsToUse[0];
     const snippet = firstRoot ? sanitize(firstRoot.textContent ?? "") : null;
 
-    const dedupedItems: RawItem[] = [];
-    const seenItems = new Set<string>();
+    // Count items instead of deduplicating - Amazon shows each item once even if ordered multiple times
+    const itemCounts = new Map<string, { count: number; price: string | null }>();
     for (const item of items) {
       const title = sanitize(item.title);
       if (!title) continue;
-      if (seenItems.has(title)) continue;
-      seenItems.add(title);
-      dedupedItems.push({ title, price: sanitize(item.price) });
+      
+      if (itemCounts.has(title)) {
+        itemCounts.get(title)!.count += 1;
+      } else {
+        itemCounts.set(title, { count: 1, price: sanitize(item.price) });
+      }
+    }
+
+    const dedupedItems: RawItem[] = Array.from(itemCounts.entries()).map(([title, info]) => ({
+      title: title,
+      price: info.price,
+      quantity: info.count
+    }));
+
+    // Extract order summary information (totals, discounts, etc.)
+    const summary: RawSummary = {};
+    
+    for (const root of rootsToUse) {
+      // Look for order summary section
+      const summarySection = root.querySelector('#od-subtotals, [data-component="orderSummary"], .order-summary');
+      
+      if (summarySection) {
+        const summaryText = summarySection.textContent || '';
+        
+        // Extract voucher/gutschein amount
+        const voucherMatch = summaryText.match(/Gutschein\s+eingelöst[:\s]+([-+]?€?\s*\d+[.,]\d{2})/i);
+        if (voucherMatch) {
+          summary.voucher = sanitize(voucherMatch[1]);
+        }
+        
+        // Extract bonus points (Prämienpunkte/Santander-Punkte)
+        const bonusMatch = summaryText.match(/Prämienpunkte[:\s]+([-+]?€?\s*\d+[.,]\d{2})/i);
+        if (bonusMatch) {
+          summary.bonusPoints = sanitize(bonusMatch[1]);
+        }
+        
+        // Extract subtotal
+        const subtotalMatch = summaryText.match(/Zwischensumme[:\s]+(€?\s*\d+[.,]\d{2})/i);
+        if (subtotalMatch) {
+          summary.subtotal = sanitize(subtotalMatch[1]);
+        }
+        
+        // Extract shipping
+        const shippingMatch = summaryText.match(/(?:Verpackung\s+&\s+Versand|Versand)[:\s]+(€?\s*\d+[.,]\d{2})/i);
+        if (shippingMatch) {
+          summary.shipping = sanitize(shippingMatch[1]);
+        }
+        
+        // Extract total
+        const totalMatch = summaryText.match(/Gesamtsumme[:\s]+(€?\s*\d+[.,]\d{2})/i);
+        if (totalMatch) {
+          summary.total = sanitize(totalMatch[1]);
+        }
+      }
+      
+      if (summary.voucher || summary.bonusPoints || summary.total) break;
     }
 
     return {
       titles,
       items: dedupedItems,
+      summary,
       debugSelectors,
       foundRoot: (firstRoot instanceof HTMLElement && firstRoot.id) ? `#${firstRoot.id}` : (firstRoot?.tagName ?? "unknown"),
       rootSnippet: snippet ? snippet.slice(0, 500) : null
     };
   });
 
-  console.log(`   Selektor-Treffer (${orderId} @ ${foundRoot}): ${debugSelectors.map(({ selector, hits }) => `${selector}:${hits}`).join(", ")}`);
+  console.log(`   Selektor-Treffer (${orderId} @ ${foundRoot}): ${debugSelectors.map((d: any) => {
+    let info = `${d.selector}:${d.hits}`;
+    if (d.qtyDivs !== undefined) info += ` [${d.qtyDivs} qty-divs]`;
+    if (d.quantities) info += ` (${d.quantities})`;
+    return info;
+  }).join(", ")}`);
   if (titles.length === 0 && rootSnippet) {
     console.log(`   [Debug] Root-Ausschnitt (${orderId}): ${rootSnippet}`);
   }
@@ -701,13 +848,50 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
     if (!title) continue;
     if (seenItemTitles.has(title)) continue;
     seenItemTitles.add(title);
-    normalizedItems.push({ title, price: item.price ?? null });
+    normalizedItems.push({ 
+      title, 
+      price: item.price ?? null,
+      quantity: item.quantity 
+    });
   }
+
+  // Calculate subtotal from item prices (brutto) instead of using Amazon's value (which may be netto)
+  let calculatedSubtotal: string | null = null;
+  if (normalizedItems.length > 0) {
+    let sum = 0;
+    let hasAllPrices = true;
+    for (const item of normalizedItems) {
+      if (!item.price) {
+        hasAllPrices = false;
+        break;
+      }
+      const priceStr = item.price.replace(/[€\s]/g, '').replace(',', '.');
+      const priceNum = parseFloat(priceStr);
+      if (isNaN(priceNum)) {
+        hasAllPrices = false;
+        break;
+      }
+      const quantity = item.quantity ?? 1;
+      sum += priceNum * quantity;
+    }
+    if (hasAllPrices && sum > 0) {
+      calculatedSubtotal = sum.toFixed(2).replace('.', ',');
+    }
+  }
+
+  const normalizedSummary: OrderSummary = {
+    subtotal: calculatedSubtotal ?? rawSummary?.subtotal ?? null,
+    voucher: rawSummary?.voucher ?? null,
+    bonusPoints: rawSummary?.bonusPoints ?? null,
+    shipping: rawSummary?.shipping ?? null,
+    total: rawSummary?.total ?? null
+  };
 
   console.timeEnd(label);
   return {
     titles: unique.length ? unique : null,
-    items: normalizedItems.length ? normalizedItems : null
+    items: normalizedItems.length ? normalizedItems : null,
+    summary: (normalizedSummary.voucher || normalizedSummary.bonusPoints || normalizedSummary.total) ? normalizedSummary : null
   };
 }
 
@@ -723,14 +907,33 @@ async function setupRequestBlocking(page: Page) {
 }
 
 async function main() {
+  // Check if storage state exists
+  const storageStatePath = "amazon.storageState.json";
+  let storageStateExists = false;
+  try {
+    const fs = await import('fs/promises');
+    await fs.access(storageStatePath);
+    storageStateExists = true;
+    console.log(`✅ Storage State gefunden: ${storageStatePath}`);
+  } catch {
+    console.warn(`⚠️  Storage State nicht gefunden: ${storageStatePath}`);
+    console.warn(`   Bitte führe zuerst 'npm run login' aus!`);
+  }
+
   const browser = await chromium.launch({ headless: HEADLESS });
-  const context = await browser.newContext({
+  const contextOptions: any = {
     ...devices["Desktop Chrome"],
-    storageState: "amazon.storageState.json",
     locale: "de-DE",
     timezoneId: "Europe/Berlin",
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
-  });
+  };
+  
+  // Only add storageState if file exists
+  if (storageStateExists) {
+    contextOptions.storageState = storageStatePath;
+  }
+  
+  const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
   if (BLOCK_RESOURCES) {
     await setupRequestBlocking(page);
@@ -758,13 +961,18 @@ async function main() {
     const detail = await fetchOrderTitles(page, tx.orderId, tx.orderUrl ?? null);
     const rawTitles = detail?.titles ?? null;
     const rawItems = detail?.items ?? null;
+    const orderSummary = detail?.summary ?? null;
 
     const cleanedTitles = rawTitles ? rawTitles.filter((t) => !/Anmelden/i.test(t)) : null;
     const dedupedTitles = cleanedTitles ? Array.from(new Set(cleanedTitles)) : null;
 
     const cleanedItems = rawItems
       ? rawItems
-          .map((item) => ({ title: item.title.trim(), price: item.price }))
+          .map((item) => ({ 
+            title: item.title.trim(), 
+            price: item.price,
+            ...(item.quantity && item.quantity > 1 ? { quantity: item.quantity } : {})
+          }))
           .filter((item) => !isLoginText(item.title))
       : null;
 
@@ -775,6 +983,7 @@ async function main() {
       r.orderItems = cleanedItems;
       r.orderTitles = dedupedTitles;
       r.orderDescription = formattedDescription;
+      r.orderSummary = orderSummary;
       scrubLoginFields(r);
       // Generate AI summary for YNAB memo
       if (formattedDescription) {
@@ -788,7 +997,8 @@ async function main() {
     } else {
       const previewSource = cleanedItems && cleanedItems.length ? cleanedItems.map(i => i.title) : (dedupedTitles ?? []);
       const preview = previewSource.slice(0, 3).join(' | ');
-      console.log(`   [Detail] ${tx.orderId}: ${previewSource.length} Positionen erfasst. Vorschau: ${preview}`);
+      const summaryInfo = orderSummary ? ` [Gutschein: ${orderSummary.voucher || 'keine'}, Punkte: ${orderSummary.bonusPoints || 'keine'}]` : '';
+      console.log(`   [Detail] ${tx.orderId}: ${previewSource.length} Positionen erfasst. Vorschau: ${preview}${summaryInfo}`);
     }
     await page.waitForTimeout(150);
   }
@@ -813,10 +1023,44 @@ async function main() {
     }
   }
 
-  const keyOf = (t: Transaction) => [t.orderId ?? "no-id", t.amount ?? "no-amount", t.date ?? "no-date"].join("|");
+  const keyOf = (t: Transaction) => {
+    // For multi-order transactions, include orderIndex to ensure unique keys
+    const parts = [
+      t.orderId ?? "no-id",
+      t.amount ?? (t.totalAmount ?? "no-amount"),
+      t.date ?? "no-date"
+    ];
+    if (t.multiOrderTransaction && t.orderIndex !== undefined) {
+      parts.push(`idx-${t.orderIndex}`);
+    }
+    return parts.join("|");
+  };
 
   // Build index of existing by key and scrub old login artefacts
-  const existingArr: Transaction[] = (existing?.transactions ?? []).filter(t => t.paymentInstrument !== "Amazon Punkte Punkte");
+  // Also filter out old entries with malformed orderIds (ending with '-')
+  // Also filter out entries that are being replaced by multi-order transactions
+  const newMultiOrderIds = new Set<string>();
+  for (const t of transactions) {
+    if (t.multiOrderTransaction && t.orderId) {
+      newMultiOrderIds.add(t.orderId);
+    }
+  }
+  
+  const existingArr: Transaction[] = (existing?.transactions ?? []).filter(t => {
+    if (t.paymentInstrument === "Amazon Punkte Punkte" || t.paymentInstrument === "Santander-Punkte") {
+      return false;
+    }
+    // Filter out old entries with malformed orderIds (ending with '-')
+    if (t.orderId && t.orderId.endsWith('-')) {
+      return false;
+    }
+    // Filter out old single-order entries that are now part of multi-order transactions
+    if (t.orderId && !t.multiOrderTransaction && newMultiOrderIds.has(t.orderId)) {
+      console.log(`   [Merge] Removing old single-order entry for ${t.orderId} (now part of multi-order transaction)`);
+      return false;
+    }
+    return true;
+  });
   for (const et of existingArr) scrubLoginFields(et);
   const existingByKey = new Map<string, Transaction>(existingArr.map((t) => [keyOf(t), t]));
 
@@ -832,6 +1076,7 @@ async function main() {
       if (t.orderTitles !== undefined) ex.orderTitles = t.orderTitles ?? ex.orderTitles ?? null;
       if (t.orderDescription !== undefined) ex.orderDescription = t.orderDescription ?? ex.orderDescription ?? null;
       if (t.orderItems !== undefined) ex.orderItems = t.orderItems ?? ex.orderItems ?? null;
+      if (t.orderSummary !== undefined) ex.orderSummary = t.orderSummary ?? ex.orderSummary ?? null;
       if (t.aiSummary !== undefined) ex.aiSummary = t.aiSummary ?? ex.aiSummary ?? null;
       // Ensure no login artefacts remain after merge
       scrubLoginFields(ex);
