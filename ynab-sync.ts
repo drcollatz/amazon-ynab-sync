@@ -91,6 +91,13 @@ type ParsedTransaction = {
     duplicateImportId?: boolean;
     amountMilliunits?: number;
   } | null;
+  orderSummary?: {
+    total?: string | null;
+    subtotal?: string | null;
+    shipping?: string | null;
+    voucher?: string | null;
+    bonusPoints?: string | null;
+  } | null;
 };
 
 type CandidateRecord = ParsedTransaction & { __index: number; isoDate: string };
@@ -256,14 +263,15 @@ function parseGermanDateToISO(d: string): string | null {
   return `${m[3]}-${month}-${day}`;
 }
 
-function amountToMilliunits(amountStr: string, isRefundFlag: boolean): number {
+function amountToMilliunits(amountStr: string | null | undefined, isRefundFlag: boolean): number {
+  if (!amountStr) return 0;
   const isPositive = amountStr.includes("+") || isRefundFlag;
   const sign = isPositive ? 1 : -1;
-  
+
   // Handle both German (€,) and English (€.) format
-  const cleanAmount = amountStr.replace(/[^\d,.-]/g, "");
+  const cleanAmount = amountStr.replace(/[^\d,.]/g, "");
   let numeric: number;
-  
+
   if (cleanAmount.includes(",") && !cleanAmount.includes(".")) {
     // German format: "19,94" -> "19.94"
     numeric = parseFloat(cleanAmount.replace(",", "."));
@@ -285,7 +293,7 @@ function amountToMilliunits(amountStr: string, isRefundFlag: boolean): number {
     // No separators, just digits
     numeric = parseFloat(cleanAmount);
   }
-  
+
   return Math.round(sign * numeric * 1000);
 }
 
@@ -326,19 +334,19 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<Ynab
 }
 
 (async () => {
-const summary: SyncSummary = {
-  timestamp: new Date().toISOString(),
-  dryRun: DRY_RUN,
-  totals: {
-    fileTransactions: 0,
-    withOrderId: 0,
-    withValidDate: 0,
-    eligibleBeforeSelection: 0,
-  },
-  filters: {
-    invalidDate: makeFilterEntry(),
-    alreadySynced: makeFilterEntry(),
-  },
+  const summary: SyncSummary = {
+    timestamp: new Date().toISOString(),
+    dryRun: DRY_RUN,
+    totals: {
+      fileTransactions: 0,
+      withOrderId: 0,
+      withValidDate: 0,
+      eligibleBeforeSelection: 0,
+    },
+    filters: {
+      invalidDate: makeFilterEntry(),
+      alreadySynced: makeFilterEntry(),
+    },
     flags: {
       ynabSyncedWithoutId: makeFilterEntry(),
     },
@@ -375,11 +383,46 @@ const summary: SyncSummary = {
       logInfo(`Eingeschränkter Sync auf ${selectedOrderIdSet.size} Order-IDs`, {
         preview: Array.from(selectedOrderIdSet).slice(0, 20),
       });
+
+      // Expand selection: If any part of a multi-order transaction is selected,
+      // ensure the primary transaction (orderIndex 0) is also selected.
+      const multiOrderGroups = new Map<string, any[]>();
+
+      // Group by unique key for the transaction bundle (date + totalAmount)
+      for (const t of transactions) {
+        if ((t as any).multiOrderTransaction === true && t.date && (t as any).totalAmount) {
+          const key = `${t.date}|${(t as any).totalAmount}`;
+          if (!multiOrderGroups.has(key)) {
+            multiOrderGroups.set(key, []);
+          }
+          multiOrderGroups.get(key)!.push(t);
+        }
+      }
+
+      for (const group of multiOrderGroups.values()) {
+        const groupIds = group.map(t => t.orderId).filter(Boolean);
+        const hasSelection = groupIds.some((id: string) => selectedOrderIdSet.has(id));
+
+        if (hasSelection) {
+          // Find primary transaction (orderIndex 0)
+          const primary = group.find(t => t.orderIndex === 0);
+          if (primary && primary.orderId && !selectedOrderIdSet.has(primary.orderId)) {
+            logInfo(`Automatisch primäre Transaktion hinzugefügt für Split: ${primary.orderId}`);
+            selectedOrderIdSet.add(primary.orderId);
+
+            // Also ensure the primary is NOT marked as "not-found" in the status map
+            if (selectionStatusMap && selectionStatusMap.has(primary.orderId)) {
+              selectionStatusMap.delete(primary.orderId);
+              // It will be re-added as "queued" later if processed
+            }
+          }
+        }
+      }
     }
 
     // Group transactions by orderId to identify Santander-Punkte companions
     const transactionsByOrderId = new Map<string, Array<{ transaction: ParsedTransaction; index: number }>>();
-    
+
     transactions.forEach((transaction, index) => {
       const orderId = typeof transaction.orderId === "string" ? transaction.orderId.trim() : null;
       if (orderId) {
@@ -446,9 +489,9 @@ const summary: SyncSummary = {
       if (isMultiOrder && orderIndex !== 0) {
         logInfo(`Überspringe sekundäre Multi-Order Transaktion: ${sampleId} (Teil ${orderIndex + 1})`);
         if (orderId && selectionStatusMap?.has(orderId)) {
-          selectionStatusMap.set(orderId, { 
-            status: "already-synced", 
-            detail: "Teil einer Multi-Order-Transaktion (nicht primär)" 
+          selectionStatusMap.set(orderId, {
+            status: "already-synced",
+            detail: "Teil einer Multi-Order-Transaktion (nicht primär)"
           });
         }
         return;
@@ -468,7 +511,7 @@ const summary: SyncSummary = {
       // For multi-order transactions, use totalAmount instead of amount
       const isMultiOrder = (candidate as any).multiOrderTransaction === true;
       const amountStr = isMultiOrder ? ((candidate as any).totalAmount || candidate.amount) : candidate.amount;
-      
+
       const amountMilli = amountToMilliunits(amountStr, !!candidate.isRefund);
       summary.candidates.totalAmountMilliunits += amountMilli;
       if (candidate.isRefund) {
@@ -490,21 +533,21 @@ const summary: SyncSummary = {
       // Build memo with Santander-Punkte info if applicable
       let memo = candidate.aiSummary ||
         (candidate.orderDescription ? candidate.orderDescription.slice(0, 200) : "");
-      
+
       // Check if there's a Santander-Punkte transaction for the same order
       const orderId = typeof candidate.orderId === "string" ? candidate.orderId.trim() : null;
-      
+
       // For multi-order transactions, append details about all orders
       const multiOrderFlag = (candidate as any).multiOrderTransaction === true;
       const totalOrders = (candidate as any).totalOrders;
       if (multiOrderFlag && totalOrders && totalOrders > 1 && orderId) {
         // Find all related orders from the same date
-        const relatedOrders = transactions.filter((t: any) => 
-          t.multiOrderTransaction === true && 
+        const relatedOrders = transactions.filter((t: any) =>
+          t.multiOrderTransaction === true &&
           t.date === candidate.date &&
           t.totalAmount === (candidate as any).totalAmount
         );
-        
+
         if (relatedOrders.length > 1) {
           const orderSummaries = relatedOrders
             .sort((a: any, b: any) => (a.orderIndex || 0) - (b.orderIndex || 0))
@@ -515,17 +558,17 @@ const summary: SyncSummary = {
               return `[${idx + 1}] ${itemPreview} (${orderTotal}€)`;
             })
             .join(" | ");
-          
+
           memo = `Multi-Order: ${orderSummaries}`;
         }
       }
-      
+
       if (orderId && transactionsByOrderId.has(orderId)) {
         const relatedTransactions = transactionsByOrderId.get(orderId)!;
         const santanderTransaction = relatedTransactions.find(
           rt => rt.transaction.paymentInstrument?.includes('Santander-Punkte')
         );
-        
+
         if (santanderTransaction) {
           const punkteAmount = santanderTransaction.transaction.amount || "0";
           // Append Santander-Punkte info to memo
@@ -538,7 +581,7 @@ const summary: SyncSummary = {
         }
       }
 
-      const payload: YnabSyncPayload = {
+      const payload: YnabSyncPayload & { subtransactions?: any[] } = {
         account_id: YNAB_ACCOUNT_ID,
         date: candidate.isoDate,
         amount: amountMilli,
@@ -548,6 +591,65 @@ const summary: SyncSummary = {
         approved: false,
         import_id: importId,
       };
+
+      // For multi-order transactions, verify if we can build valid subtransactions
+      if (multiOrderFlag && totalOrders && totalOrders > 1 && orderId) {
+        // Find all related orders
+        const relatedOrders = transactions.filter((t: any) =>
+          t.multiOrderTransaction === true &&
+          t.date === candidate.date &&
+          t.totalAmount === (candidate as any).totalAmount
+        ).sort((a: any, b: any) => (a.orderIndex || 0) - (b.orderIndex || 0));
+
+        // Attempt to build subtransactions
+        let subSum = 0;
+        const potentialSubs: any[] = [];
+        const isMainRefund = !!candidate.isRefund;
+
+        for (const order of relatedOrders) {
+          const totalStr = order.orderSummary?.total; // e.g. "14,99"
+          if (!totalStr) continue;
+
+          // Use main transaction sign logic
+          // If main amount is negative (outflow), subs should be negative (outflow)
+          // unless specific logic dictates otherwise. Amazon multi-order is usually all purchases.
+          const subMilli = amountToMilliunits(totalStr, isMainRefund);
+          // But wait, amountToMilliunits assumes positive string "14,99" -> 14990. 
+          // If main transaction is "charge", we need NEGATIVE.
+          // totalAmount is "-129.59" -> -129590.
+
+          // We need to match the sign of the MAIN transaction amount (amountMilli)
+          // amountMilli is usually negative for purchases. 
+          // amountToMilliunits("14,99", false) -> 14990 (positive).
+          // We need to invert it if amountMilli is negative.
+
+          let finalSubMilli = subMilli;
+          if (amountMilli < 0) {
+            finalSubMilli = -Math.abs(subMilli);
+          } else {
+            finalSubMilli = Math.abs(subMilli);
+          }
+
+          subSum += finalSubMilli;
+
+          const firstItem = order.orderItems?.[0]?.title || order.orderId || "Unbekannt";
+          const itemPreview = firstItem.length > 50 ? firstItem.slice(0, 50) + "..." : firstItem;
+
+          potentialSubs.push({
+            amount: finalSubMilli,
+            memo: `[${(order as any).orderIndex + 1}] ${itemPreview}`
+          });
+        }
+
+        // Verify sum with small tolerance for float math or rounding
+        if (potentialSubs.length === relatedOrders.length && Math.abs(subSum - amountMilli) <= 10) {
+          payload.subtransactions = potentialSubs;
+          // If we have subtransactions, we might want to keep the main memo simple?
+          // user wanted "better representation", splits IS better.
+        } else {
+          logInfo(`Note: Subtransactions sum (${subSum}) mismatch with total (${amountMilli}) or missing data. Falling back to simple memo.`);
+        }
+      }
 
       return {
         original: candidate,
@@ -630,14 +732,14 @@ const summary: SyncSummary = {
           });
         }
       }
-      
+
       // Also mark Santander-Punkte companion transactions as synced (attached to main transaction)
       if (orderId && transactionsByOrderId.has(orderId)) {
         const relatedTransactions = transactionsByOrderId.get(orderId)!;
         const santanderTransaction = relatedTransactions.find(
           rt => rt.transaction.paymentInstrument?.includes('Santander-Punkte')
         );
-        
+
         if (santanderTransaction) {
           const santanderIdx = santanderTransaction.index;
           parsed.transactions[santanderIdx].ynabSynced = true;
@@ -649,6 +751,57 @@ const summary: SyncSummary = {
             amountMilliunits: amountToMilliunits(santanderTransaction.transaction.amount, false),
           };
           logInfo(`Santander-Punkte als Teil der Haupttransaktion markiert: ${orderId}`);
+        }
+      }
+
+      // Mark sibling multi-order transactions (secondary parts) as synced
+      if ((item.original as any).multiOrderTransaction === true && orderId) {
+        // Find siblings based on group key (date + totalAmount)
+        // Since we are iterating strictly, we can scan the full list or use a helper map if performance matters.
+        // For simplicity, let's scan.
+        const siblings = transactions.reduce((acc: number[], t, idx) => {
+          if ((t as any).multiOrderTransaction === true &&
+            t.date === item.original.date &&
+            (t as any).totalAmount === (item.original as any).totalAmount &&
+            (t as any).orderIndex !== (item.original as any).orderIndex) {
+            acc.push(idx);
+          }
+          return acc;
+        }, []);
+
+        for (const siblingIdx of siblings) {
+          const sibling = parsed.transactions[siblingIdx];
+          // Only mark if not already marked (though here we overwrite to link to THIS sync event)
+          sibling.ynabSynced = true;
+          sibling.ynabSync = {
+            at: new Date().toISOString(),
+            importId: `${item.importId}:split:${(sibling as any).orderIndex}`,
+            ynabTransactionId: matchedId, // Link to the same primary transaction ID
+            duplicateImportId: false,
+            amountMilliunits: amountToMilliunits(sibling.amount, false) // This might be wrong logic for amount, but it's just metadata
+          };
+          // Note: sibling.amount is null for multi-order usually? No, it's null in my memory, let's check.
+          // In debug output: amount: null. So amountMilliunits will be 0.
+          // We should use orderSummary.total if available.
+          const siblingTotal = (sibling as any).orderSummary?.total;
+          if (siblingTotal) {
+            // Use same sign logic as main transaction if possible, or just parse.
+            // Main transaction is usually outflow (-). Sibling order total is positive string "14,99".
+            // We want to record the partial amount.
+            let subMilli = amountToMilliunits(siblingTotal, false);
+            if (item.amountMilli < 0) subMilli = -Math.abs(subMilli);
+            else subMilli = Math.abs(subMilli);
+
+            (sibling.ynabSync as any).amountMilliunits = subMilli;
+          }
+
+          const sibOrderId = typeof sibling.orderId === "string" ? sibling.orderId.trim() : null;
+          if (sibOrderId && selectionStatusMap?.has(sibOrderId)) {
+            selectionStatusMap.set(sibOrderId, {
+              status: "synced",
+              detail: "Teil einer Multi-Order-Transaktion (Split)"
+            });
+          }
         }
       }
     }
@@ -664,13 +817,13 @@ const summary: SyncSummary = {
   } catch (error: any) {
     const message = error?.message || String(error);
     const stack = error?.stack || 'No stack trace available';
-    
+
     // Enhanced error logging for better debugging
     console.error("=== YNAB SYNC FEHLER ===");
     console.error("Error Message:", message);
     console.error("Error Type:", error?.constructor?.name || 'Unknown');
     console.error("Stack Trace:", stack);
-    
+
     // Log environment information for debugging
     console.error("=== ENVIRONMENT ===");
     console.error("YNAB_TOKEN exists:", !!YNAB_TOKEN);
@@ -680,14 +833,14 @@ const summary: SyncSummary = {
     console.error("File exists:", require('fs').existsSync(INPUT_FILE));
     console.error("DRY_RUN:", DRY_RUN);
     console.error("Selected Order IDs:", selectedOrderIds.length);
-    
+
     // If it's a network/HTTP error, log more details
     if (message.includes('HTTP') || message.includes('fetch') || message.includes('network')) {
       console.error("=== NETWORK ERROR DETAILS ===");
       console.error("This appears to be a network-related error.");
       console.error("Please check your internet connection and YNAB API accessibility.");
     }
-    
+
     // If it's an environment variable error
     if (message.includes('YNAB_TOKEN') || message.includes('environment') || !YNAB_TOKEN || !YNAB_ACCOUNT_ID) {
       console.error("=== ENVIRONMENT VARIABLE ERROR ===");
@@ -696,7 +849,7 @@ const summary: SyncSummary = {
       console.error("- YNAB_ACCOUNT_ID: Your YNAB account ID");
       console.error("Check your .env file or environment configuration.");
     }
-    
+
     // If it's a file error
     if (message.includes('ENOENT') || message.includes('readFileSync') || message.includes('transactions.json')) {
       console.error("=== FILE ERROR ===");
@@ -706,7 +859,7 @@ const summary: SyncSummary = {
       console.error("2. File is corrupted or invalid JSON");
       console.error("3. Insufficient file permissions");
     }
-    
+
     summary.response.error = message;
     console.error("=== SYNC SUMMARY AT ERROR ===");
     summary.selection = buildSelectionSummary(selectionStatusMap);

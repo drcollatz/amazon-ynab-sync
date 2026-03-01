@@ -316,7 +316,7 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
     <section className="config-section">
       <div className="config-heading">
         <h2>Konfiguration</h2>
-        <p>Steuern Sie Login und Sync-Einstellungen, bevor Sie Transaktionen importieren.</p>
+
       </div>
 
       <div className="config-item">
@@ -350,7 +350,7 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
 
       <div className="config-item">
         <h3>Amazon Transaktionen Sync</h3>
-        <p>Lädt die neuesten Transaktionen von Amazon.</p>
+
         <div className="timeframe-controls">
           <label>
             <input

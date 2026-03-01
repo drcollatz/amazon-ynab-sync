@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import type { Transaction } from '../App';
 
 const euroFormatter = new Intl.NumberFormat('de-DE', {
@@ -117,7 +118,7 @@ function SyncResultModal({ result, onClose }: SyncResultModalProps) {
   const response = summary?.response;
   const isConfigError = Boolean(configurationHelp);
 
-  return (
+  return createPortal(
     <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onClose}>
       <div
         className={`modal ${success ? 'modal-success' : 'modal-error'}`}
@@ -131,7 +132,7 @@ function SyncResultModal({ result, onClose }: SyncResultModalProps) {
         </div>
         <div className="modal-body">
           <p className="modal-message">{message}</p>
-          
+
           {configurationHelp && (
             <div className="config-help">
               <h4>🔧 Fehlende Konfiguration</h4>
@@ -141,27 +142,27 @@ function SyncResultModal({ result, onClose }: SyncResultModalProps) {
                   <li key={item}><code>{item}</code></li>
                 ))}
               </ul>
-              
+
               <h4>📋 Anleitung zur Konfiguration</h4>
               <ol className="config-instructions">
                 {configurationHelp.instructions.map((instruction, idx) => (
                   <li key={idx}>{instruction}</li>
                 ))}
               </ol>
-              
+
               <div className="config-example">
                 <h5>Beispiel .env Datei:</h5>
                 <pre>
-{`YNAB_TOKEN=dein_personal_access_token_hier
+                  {`YNAB_TOKEN=dein_personal_access_token_hier
 YNAB_ACCOUNT_ID=deine_account_id_hier
 YNAB_BUDGET_ID=last-used`}
                 </pre>
               </div>
-              
+
               <div className="config-links">
-                <a 
-                  href="https://app.youneedabudget.com/settings/developer" 
-                  target="_blank" 
+                <a
+                  href="https://app.youneedabudget.com/settings/developer"
+                  target="_blank"
                   rel="noopener noreferrer"
                   className="btn-primary"
                 >
@@ -170,7 +171,7 @@ YNAB_BUDGET_ID=last-used`}
               </div>
             </div>
           )}
-          
+
           {!isConfigError && timestamp && <p className="modal-timestamp">Zeitpunkt: {timestamp}</p>}
 
           {summary && (
@@ -314,7 +315,8 @@ YNAB_BUDGET_ID=last-used`}
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -349,7 +351,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
     return transactions.filter((tx) => {
       const isSantanderPunkte = tx.paymentInstrument?.includes('Santander-Punkte');
       if (!isSantanderPunkte) return true;
-      
+
       // Check if there's a main transaction for the same order
       if (tx.orderId && transactionGroups.has(tx.orderId)) {
         const group = transactionGroups.get(tx.orderId)!;
@@ -415,7 +417,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
           output: data.output ?? null,
           stderr: data.stderr ?? null
         });
-        
+
         // Clear selection for synced transactions
         setSelectedIndices(prev => {
           const next = new Set(prev);
@@ -427,7 +429,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
           });
           return next;
         });
-        
+
         // Refresh data after a short delay to allow user to see the modal first
         setTimeout(() => {
           onRefresh();
@@ -714,8 +716,8 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
                     </div>
                     <div className="transaction-amount-section">
                       <span className={`transaction-amount ${transaction.isRefund ? 'is-refund' : ''}`}>
-                        {transaction.multiOrderTransaction && transaction.totalAmount 
-                          ? transaction.totalAmount 
+                        {transaction.multiOrderTransaction && transaction.totalAmount
+                          ? transaction.totalAmount
                           : transaction.amount}
                       </span>
                       {transaction.multiOrderTransaction && transaction.totalOrders && (
@@ -802,7 +804,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
                   <div className="transaction-card__footer">
                     <div className="transaction-meta">
                       {transaction.orderId && (
-                        <a 
+                        <a
                           href={transaction.orderUrl || `https://www.amazon.de/gp/css/summary/edit.html?orderID=${transaction.orderId}`}
                           target="_blank"
                           rel="noopener noreferrer"
