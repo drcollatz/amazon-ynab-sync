@@ -4,10 +4,13 @@
   "description": "Amazon to YNAB Sync with React UI",
   "main": "server.ts",
   "scripts": {
-    "dev": "npm run server & npm run client",
+    "dev": "concurrently \"npm run server:watch\" \"npm run client\"",
     "server": "npx ts-node server.ts",
+    "server:watch": "node --watch -r ts-node/register server.ts",
     "client": "cd client && npm run dev",
     "build": "cd client && npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test -r ts-node/register tests/*.test.ts",
     "login": "npx ts-node login.ts",
     "sync": "npx ts-node transactions-to-json.ts",
     "ynab": "npx ts-node ynab-sync.ts"

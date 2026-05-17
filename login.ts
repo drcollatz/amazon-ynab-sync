@@ -1,4 +1,5 @@
 import { chromium, devices } from "playwright";
+import fs from "fs";
 
 // Constants for configuration
 const BROWSER_CONFIG = {
@@ -22,6 +23,24 @@ const STORAGE_STATE_PATH = "amazon.storageState.json";
 
 const LOGIN_TIMEOUT = 120_000;
 
+function pickDetailOrderId(): string | null {
+  const explicit = process.env.LOGIN_DETAIL_ORDER_ID?.trim();
+  if (explicit) return explicit;
+  try {
+    const raw = fs.readFileSync("transactions.json", "utf8");
+    const parsed = JSON.parse(raw) as { transactions?: Array<{ orderId?: string | null; orderDescription?: string | null; orderItems?: unknown[] | null; detailsStatus?: string | null }> };
+    const transactions = Array.isArray(parsed.transactions) ? parsed.transactions : [];
+    const missingDetails = transactions.find(transaction =>
+      transaction.orderId &&
+      (!transaction.orderDescription || !transaction.orderItems?.length || transaction.detailsStatus === "reauth-required")
+    );
+    const anyOrder = transactions.find(transaction => transaction.orderId);
+    return missingDetails?.orderId ?? anyOrder?.orderId ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Main function to perform Amazon login and save storage state
  */
@@ -44,6 +63,16 @@ async function main(): Promise<void> {
 
     // Verify login by waiting for orders page to load
     await page.waitForSelector(ORDERS_SELECTOR, { timeout: LOGIN_TIMEOUT });
+
+    const detailOrderId = pickDetailOrderId();
+    if (detailOrderId) {
+      console.log(`Prüfe Bestelldetails für Reauth: ${detailOrderId}`);
+      await page.goto(`https://www.amazon.de/gp/css/summary/edit.html?orderID=${encodeURIComponent(detailOrderId)}`, { waitUntil: "domcontentloaded" });
+      await page.waitForSelector("#orderDetails, #od-container, #a-page #od-content", { timeout: LOGIN_TIMEOUT });
+      console.log("✅ Bestelldetails sind erreichbar");
+    } else {
+      console.log("Keine Order-ID für Detail-Reauth gefunden; speichere Zahlungs-/Bestell-Session.");
+    }
 
     // Save login state
     await context.storageState({ path: STORAGE_STATE_PATH });

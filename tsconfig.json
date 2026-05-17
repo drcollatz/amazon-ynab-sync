@@ -17,7 +17,8 @@
     }
   },
   "include": [
-    "*.ts"
+    "*.ts",
+    "tests/**/*.ts"
   ],
   "exclude": [
     "client"

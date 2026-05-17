@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import type { Transaction } from '../App';
+import { ApiError, apiPost } from '../api';
 
 const euroFormatter = new Intl.NumberFormat('de-DE', {
   style: 'currency',
@@ -88,6 +89,15 @@ interface SyncResult {
 interface SyncResultModalProps {
   result: SyncResult;
   onClose: () => void;
+}
+
+interface ConfirmDialogProps {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  tone?: 'danger' | 'neutral';
+  onCancel: () => void;
+  onConfirm: () => void;
 }
 
 function formatCurrencyFromMilliunits(value?: number | null): string | null {
@@ -320,6 +330,33 @@ YNAB_BUDGET_ID=last-used`}
   );
 }
 
+function ConfirmDialog({ title, message, confirmLabel, tone = 'neutral', onCancel, onConfirm }: ConfirmDialogProps) {
+  return createPortal(
+    <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={onCancel}>
+      <div className={`modal modal-confirm ${tone === 'danger' ? 'modal-error' : ''}`} onClick={(event) => event.stopPropagation()}>
+        <div className="modal-header">
+          <h3>{title}</h3>
+          <button type="button" className="modal-close" onClick={onCancel} aria-label="Schließen">
+            ×
+          </button>
+        </div>
+        <div className="modal-body">
+          <p className="modal-message">{message}</p>
+        </div>
+        <div className="modal-footer">
+          <button type="button" className="btn-secondary" onClick={onCancel}>
+            Abbrechen
+          </button>
+          <button type="button" className={tone === 'danger' ? 'btn-danger' : 'btn-primary'} onClick={onConfirm}>
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 function TransactionList({ transactions, loading, onRefresh }: TransactionListProps) {
   // Use index-based selection to handle duplicate order IDs
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
@@ -328,6 +365,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogProps | null>(null);
 
   const openSyncResult = (result: SyncResult) => setSyncResult(result);
   const closeSyncResult = () => setSyncResult(null);
@@ -402,12 +440,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
 
     setSyncLoading(true);
     try {
-      const response = await fetch('http://localhost:3001/api/sync-ynab', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transactionIds: idsToSync })
-      });
-      const data = await response.json();
+      const data = await apiPost<SyncResult>('/api/sync-ynab', { transactionIds: idsToSync });
       if (data.success) {
         // First show success modal
         openSyncResult({
@@ -441,12 +474,23 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
           summary: data.summary ?? null,
           output: data.output ?? null,
           stderr: data.stderr ?? null,
-          configurationHelp: data.configurationHelp ?? null
+          configurationHelp: data.configurationHelp ?? undefined
         });
       }
     } catch (error) {
       console.error('Fehler beim Sync mit YNAB', error);
-      openSyncResult({ success: false, message: 'Fehler beim Sync mit YNAB' });
+      const message = error instanceof ApiError ? error.message : 'Fehler beim Sync mit YNAB';
+      const data = error instanceof ApiError && error.data && typeof error.data === 'object'
+        ? error.data as Partial<SyncResult>
+        : {};
+      openSyncResult({
+        success: false,
+        message,
+        summary: data.summary ?? null,
+        configurationHelp: data.configurationHelp ?? undefined,
+        output: data.output ?? null,
+        stderr: data.stderr ?? null
+      });
     } finally {
       setSyncLoading(false);
     }
@@ -485,29 +529,18 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
     }));
 
     try {
-      const response = await fetch('http://localhost:3001/api/ai-summary', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text,
-          orderId: transaction.orderId ?? null
-        })
+      const data = await apiPost<{ summary: string; model: string }>('/api/ai-summary', {
+        text,
+        orderId: transaction.orderId ?? null
       });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.error || 'Unbekannter Fehler');
-      }
       setSummaries(prev => ({
         ...prev,
         [key]: { loading: false, summary: data.summary, model: data.model }
       }));
 
       if (transaction.orderId) {
-        fetch('http://localhost:3001/api/update-ai-summary', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ orderId: transaction.orderId, aiSummary: data.summary })
-        }).catch(err => console.warn('Failed to update aiSummary:', err));
+        apiPost('/api/update-ai-summary', { orderId: transaction.orderId, aiSummary: data.summary })
+          .catch(err => console.warn('Failed to update aiSummary:', err));
       }
     } catch (error) {
       console.error('AI-Summary fehlgeschlagen', error);
@@ -525,18 +558,24 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
       const message = orderIds.length === 1
         ? 'Diese Transaktion wirklich löschen?'
         : `Die ausgewählten ${orderIds.length} Transaktionen wirklich löschen?`;
-      if (!window.confirm(message)) return;
+      setConfirmDialog({
+        title: 'Transaktionen löschen',
+        message,
+        confirmLabel: 'Löschen',
+        tone: 'danger',
+        onCancel: () => setConfirmDialog(null),
+        onConfirm: () => {
+          setConfirmDialog(null);
+          deleteTransactions(orderIds, false);
+        }
+      });
+      return;
     }
 
     setDeleteLoading(true);
     try {
-      const response = await fetch('http://localhost:3001/api/delete-transactions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ orderIds })
-      });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
+      const data = await apiPost<{ success: boolean; error?: string }>('/api/delete-transactions', { orderIds });
+      if (!data.success) {
         throw new Error(data?.error || 'Fehler beim Löschen der Transaktionen');
       }
       setSelectedIndices(prev => {
@@ -554,7 +593,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
       onRefresh();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Fehler beim Löschen der Transaktionen';
-      alert(message);
+      openSyncResult({ success: false, message });
     } finally {
       setDeleteLoading(false);
     }
@@ -571,24 +610,30 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
       const message = orderIds.length === 1
         ? 'YNAB-Status für diese Transaktion zurücksetzen?'
         : `YNAB-Status für ${orderIds.length} Transaktionen zurücksetzen?`;
-      if (!window.confirm(message)) return;
+      setConfirmDialog({
+        title: 'YNAB-Status zurücksetzen',
+        message,
+        confirmLabel: 'Zurücksetzen',
+        tone: 'neutral',
+        onCancel: () => setConfirmDialog(null),
+        onConfirm: () => {
+          setConfirmDialog(null);
+          resetYnabStatus(orderIds, false);
+        }
+      });
+      return;
     }
 
     setResetLoading(true);
     try {
-      const response = await fetch('http://localhost:3001/api/reset-ynab-status', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ orderIds })
-      });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
+      const data = await apiPost<{ success: boolean; error?: string }>('/api/reset-ynab-status', { orderIds });
+      if (!data.success) {
         throw new Error(data?.error || 'Fehler beim Zurücksetzen des YNAB-Status');
       }
       onRefresh();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Fehler beim Zurücksetzen des YNAB-Status';
-      alert(message);
+      openSyncResult({ success: false, message });
     } finally {
       setResetLoading(false);
     }
@@ -868,6 +913,7 @@ function TransactionList({ transactions, loading, onRefresh }: TransactionListPr
       </div>
 
       {syncResult && <SyncResultModal result={syncResult} onClose={closeSyncResult} />}
+      {confirmDialog && <ConfirmDialog {...confirmDialog} />}
     </section>
   );
 }

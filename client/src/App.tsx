@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import './App.css';
 import ConfigSection from './components/ConfigSection';
 import TransactionList from './components/TransactionList';
+import { ApiError, apiGet, getApiBaseUrl } from './api';
 
 export interface Transaction {
   date: string | null;
@@ -39,15 +40,17 @@ export interface Transaction {
 function App() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const fetchTransactions = async () => {
     setLoading(true);
+    setLoadError(null);
     try {
-      const response = await fetch('http://localhost:3001/api/transactions');
-      const data = await response.json();
+      const data = await apiGet<{ transactions?: Transaction[] }>('/api/transactions');
       setTransactions(data.transactions || []);
     } catch (error) {
       console.error('Error fetching transactions:', error);
+      setLoadError(error instanceof ApiError ? error.message : 'Transaktionen konnten nicht geladen werden.');
     } finally {
       setLoading(false);
     }
@@ -74,6 +77,7 @@ function App() {
             <p className="header-subtitle">
               Behalten Sie Ihre Amazon-Käufe im Blick und übertragen Sie passende Transaktionen mit einem Klick nach YNAB.
             </p>
+            <p className="header-api">API: {getApiBaseUrl()}</p>
           </div>
           <div className="header-meta">
             <div className="header-stats">
@@ -103,6 +107,17 @@ function App() {
       </header>
 
       <main className="app-main">
+        {loadError && (
+          <div className="app-alert app-alert-error" role="alert">
+            <div>
+              <strong>Verbindung fehlgeschlagen</strong>
+              <span>{loadError}</span>
+            </div>
+            <button type="button" className="btn-secondary" onClick={fetchTransactions} disabled={loading}>
+              Erneut versuchen
+            </button>
+          </div>
+        )}
         <div className="app-grid">
           <ConfigSection onSyncComplete={fetchTransactions} />
           <TransactionList

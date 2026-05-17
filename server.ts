@@ -5,9 +5,30 @@ import { spawn, execSync } from 'child_process';
 import { promises as fs } from 'fs';
 import path from 'path';
 import OpenAI from 'openai';
+import type { NextFunction, Request, Response } from 'express';
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT || 3001);
+const HOST = process.env.HOST || '127.0.0.1';
+const API_AUTH_TOKEN = process.env.API_AUTH_TOKEN;
+const API_DEBUG_OUTPUT = process.env.API_DEBUG_OUTPUT === '1';
+const DEFAULT_ALLOWED_ORIGINS = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5174'
+];
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || DEFAULT_ALLOWED_ORIGINS.join(','))
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+const DEFAULT_SCRIPT_TIMEOUT_MS = Number(process.env.SCRIPT_TIMEOUT_MS || 30 * 60 * 1000);
+const LOGIN_SCRIPT_TIMEOUT_MS = Number(process.env.LOGIN_SCRIPT_TIMEOUT_MS || 10 * 60 * 1000);
+const YNAB_SCRIPT_TIMEOUT_MS = Number(process.env.YNAB_SCRIPT_TIMEOUT_MS || 3 * 60 * 1000);
+const MAX_ORDER_IDS = Number(process.env.MAX_ORDER_IDS || 500);
+const MAX_ORDER_ID_LENGTH = Number(process.env.MAX_ORDER_ID_LENGTH || 80);
+const MAX_AI_INPUT_LENGTH = Number(process.env.MAX_AI_INPUT_LENGTH || 4000);
+const TRANSACTIONS_FILE = path.join(process.cwd(), 'transactions.json');
 
 // Check if Playwright is properly installed
 async function checkPlaywrightInstallation(): Promise<void> {
@@ -38,9 +59,156 @@ async function checkPlaywrightInstallation(): Promise<void> {
   }
 }
 
+function sanitizeText(value: string, maxLength = 1000): string {
+  const secrets = [process.env.YNAB_TOKEN, process.env.OPENAI_API_KEY, API_AUTH_TOKEN]
+    .filter((secret): secret is string => Boolean(secret));
+  let sanitized = value;
+  for (const secret of secrets) {
+    sanitized = sanitized.split(secret).join('[redacted]');
+  }
+  sanitized = sanitized
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [redacted]')
+    .replace(/(api[_-]?key|token|authorization)["'\s:=]+[A-Za-z0-9._~+/=-]+/gi, '$1=[redacted]');
+  return sanitized.length > maxLength ? `${sanitized.slice(0, maxLength).trimEnd()}...` : sanitized;
+}
+
+function clientMessage(message: string): string {
+  return sanitizeText(message.replace(/\s+/g, ' ').trim(), 500);
+}
+
+function sanitizeLogLine(line: string): string {
+  return sanitizeText(line, 700);
+}
+
+function extractUsefulError(stderr = '', fallback = 'Der Vorgang ist fehlgeschlagen.'): string {
+  const lines = stderr.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const relevant = [...lines].reverse().find(line => /error|fehler|timeout|captcha|ynab|login|token|budget|account/i.test(line));
+  return clientMessage(relevant || fallback);
+}
+
+function debugOutput(text: string): string | undefined {
+  if (!API_DEBUG_OUTPUT || !text.trim()) return undefined;
+  return sanitizeText(text.trim(), 8000);
+}
+
+function requireApiKey(req: Request, res: Response, next: NextFunction) {
+  if (!API_AUTH_TOKEN) {
+    next();
+    return;
+  }
+
+  const headerToken = req.header('x-api-key');
+  const authHeader = req.header('authorization');
+  const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
+
+  if (headerToken === API_AUTH_TOKEN || bearerToken === API_AUTH_TOKEN) {
+    next();
+    return;
+  }
+
+  res.status(401).json({ error: 'Nicht autorisiert.' });
+}
+
+function normalizeOrderIds(raw: unknown, fieldName: string): string[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new Error(`${fieldName} array required`);
+  }
+  if (raw.length > MAX_ORDER_IDS) {
+    throw new Error(`Maximal ${MAX_ORDER_IDS} Order-IDs pro Anfrage erlaubt.`);
+  }
+
+  const ids = Array.from(
+    new Set(
+      raw
+        .map(id => (typeof id === 'string' ? id.trim() : ''))
+        .filter(Boolean)
+    )
+  );
+
+  if (ids.length === 0) {
+    throw new Error(`${fieldName} array required`);
+  }
+  const invalid = ids.find(id => id.length > MAX_ORDER_ID_LENGTH);
+  if (invalid) {
+    throw new Error(`Order-ID ist zu lang: ${invalid.slice(0, 24)}...`);
+  }
+  return ids;
+}
+
+function isClientInputError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /array required|Maximal|Order-ID|erforderlich|ungültig|zu lang/i.test(error.message);
+}
+
+async function writeFileAtomic(filePath: string, contents: string): Promise<void> {
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(tempPath, contents, 'utf8');
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+type TransactionsFileData = {
+  count: number;
+  withOrderId: number;
+  transactions: Transaction[];
+};
+
+function chooseDetailCheckOrderId(data: TransactionsFileData | null): string | null {
+  const transactions = data?.transactions ?? [];
+  const missingDetails = transactions.find(transaction =>
+    transaction.orderId &&
+    (!transaction.orderDescription || !transaction.orderItems?.length || (transaction as any).detailsStatus === 'reauth-required')
+  );
+  const anyOrder = transactions.find(transaction => transaction.orderId);
+  return missingDetails?.orderId ?? anyOrder?.orderId ?? null;
+}
+
+function validateTransactionsData(data: unknown): TransactionsFileData {
+  if (!data || typeof data !== 'object' || !Array.isArray((data as any).transactions)) {
+    throw new Error('transactions.json hat ein ungültiges Format.');
+  }
+  const transactions = (data as any).transactions as Transaction[];
+  return {
+    ...(data as any),
+    count: transactions.length,
+    withOrderId: transactions.filter(t => Boolean(t?.orderId)).length,
+    transactions
+  };
+}
+
+async function readTransactionsFile(): Promise<TransactionsFileData | null> {
+  const exists = await fs.access(TRANSACTIONS_FILE).then(() => true).catch(() => false);
+  if (!exists) return null;
+  const raw = await fs.readFile(TRANSACTIONS_FILE, 'utf8');
+  return validateTransactionsData(JSON.parse(raw));
+}
+
+let transactionsFileQueue: Promise<unknown> = Promise.resolve();
+
+function withTransactionsFileLock<T>(operation: () => Promise<T>): Promise<T> {
+  const run = transactionsFileQueue.then(operation, operation);
+  transactionsFileQueue = run.catch(() => undefined);
+  return run;
+}
+
 // Middleware
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error('CORS origin not allowed'));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+}));
+app.use(express.json({ limit: '256kb' }));
+app.use('/api', requireApiKey);
 
 // Root route for debugging
 app.get('/', (req, res) => {
@@ -83,6 +251,11 @@ type ScriptResult = {
 
 type ScriptError = Error & ScriptResult;
 
+type ScriptRunOptions = {
+  timeoutMs?: number;
+  env?: NodeJS.ProcessEnv;
+};
+
 type SyncStatus = {
   status: 'idle' | 'running' | 'success' | 'error';
   startedAt?: number;
@@ -92,7 +265,7 @@ type SyncStatus = {
 };
 
 type SyncRequestOptions = {
-  mode?: 'current-month' | 'last-n' | 'date-range';
+  mode?: 'current-month' | 'newest' | 'last-n' | 'date-range';
   lastCount?: number;
   startDate?: string;
   endDate?: string;
@@ -222,7 +395,7 @@ function normalizeSyncOptions(raw: any): SyncRequestOptions | undefined {
 
   const options: SyncRequestOptions = {};
   if (raw.mode && typeof raw.mode === 'string') {
-    if (raw.mode === 'current-month' || raw.mode === 'last-n' || raw.mode === 'date-range') {
+    if (raw.mode === 'current-month' || raw.mode === 'newest' || raw.mode === 'last-n' || raw.mode === 'date-range') {
       options.mode = raw.mode;
     }
   }
@@ -256,18 +429,37 @@ function normalizeSyncOptions(raw: any): SyncRequestOptions | undefined {
   return Object.keys(options).length > 0 ? options : undefined;
 }
 
-// Helper function to run scripts
-function runScript(scriptPath: string, args: string[] = []): Promise<ScriptResult> {
+// Helper function to run scripts with a hard deadline.
+function runScript(scriptPath: string, args: string[] = [], options: ScriptRunOptions = {}): Promise<ScriptResult> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeoutMs = options.timeoutMs ?? DEFAULT_SCRIPT_TIMEOUT_MS;
     const child = spawn('npx', ['ts-node', scriptPath, ...args], {
       cwd: process.cwd(),
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
-      env: process.env  // Pass environment variables to child process
+      env: options.env ?? process.env
     });
 
     const stdoutChunks: string[] = [];
     const stderrChunks: string[] = [];
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGTERM');
+      const scriptError = new Error(`Zeitlimit von ${Math.round(timeoutMs / 1000)}s überschritten.`) as ScriptError;
+      scriptError.stdout = stdoutChunks.join('');
+      scriptError.stderr = stderrChunks.join('');
+      reject(scriptError);
+    }, timeoutMs);
+
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      callback();
+    };
 
     if (child.stdout) {
       child.stdout.on('data', (data: Buffer) => {
@@ -282,27 +474,44 @@ function runScript(scriptPath: string, args: string[] = []): Promise<ScriptResul
     }
 
     child.on('error', (error) => {
-      const stdout = stdoutChunks.join('');
-      const stderr = stderrChunks.join('');
-      const scriptError = new Error(error.message) as ScriptError;
-      scriptError.stdout = stdout;
-      scriptError.stderr = stderr;
-      reject(scriptError);
-    });
-
-    child.on('close', (code) => {
-      const stdout = stdoutChunks.join('');
-      const stderr = stderrChunks.join('');
-      if (code === 0) {
-        resolve({ stdout, stderr });
-      } else {
-        const scriptError = new Error(`Script exited with code ${code}`) as ScriptError;
+      finish(() => {
+        const stdout = stdoutChunks.join('');
+        const stderr = stderrChunks.join('');
+        const scriptError = new Error(error.message) as ScriptError;
         scriptError.stdout = stdout;
         scriptError.stderr = stderr;
         reject(scriptError);
-      }
+      });
+    });
+
+    child.on('close', (code) => {
+      finish(() => {
+        const stdout = stdoutChunks.join('');
+        const stderr = stderrChunks.join('');
+        if (code === 0) {
+          resolve({ stdout, stderr });
+        } else {
+          const scriptError = new Error(`Script exited with code ${code}`) as ScriptError;
+          scriptError.stdout = stdout;
+          scriptError.stderr = stderr;
+          reject(scriptError);
+        }
+      });
     });
   });
+}
+
+function buildYnabScriptEnv(): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    TMPDIR: process.env.TMPDIR,
+    NODE_ENV: process.env.NODE_ENV,
+    YNAB_TOKEN: process.env.YNAB_TOKEN,
+    YNAB_BUDGET_ID: process.env.YNAB_BUDGET_ID,
+    YNAB_ACCOUNT_ID: process.env.YNAB_ACCOUNT_ID,
+    DRY_RUN: process.env.DRY_RUN
+  };
 }
 
 function extractYnabSummary(stdout: string) {
@@ -360,7 +569,7 @@ function startSyncScript(options?: SyncRequestOptions): Promise<ScriptResult> {
   const args = buildSyncArgs(options);
 
   syncState.logs.push({
-    line: `[SYNC] Starte Sync mit Argumenten: ${args.slice(1).join(' ') || 'standard'}`,
+    line: sanitizeLogLine(`[SYNC] Starte Sync mit Argumenten: ${args.slice(1).join(' ') || 'standard'}`),
     stream: 'stdout',
     timestamp: Date.now()
   });
@@ -369,6 +578,7 @@ function startSyncScript(options?: SyncRequestOptions): Promise<ScriptResult> {
   }
 
   return new Promise((resolve, reject) => {
+    let settled = false;
     const stdoutChunks: string[] = [];
     const stderrChunks: string[] = [];
 
@@ -378,6 +588,28 @@ function startSyncScript(options?: SyncRequestOptions): Promise<ScriptResult> {
       shell: process.platform === 'win32'
     });
 
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGTERM');
+      const message = `Sync hat das Zeitlimit von ${Math.round(DEFAULT_SCRIPT_TIMEOUT_MS / 1000)}s überschritten.`;
+      syncState.status = 'error';
+      syncState.error = message;
+      syncState.finishedAt = Date.now();
+      syncState.logs.push({ line: message, stream: 'stderr', timestamp: Date.now() });
+      const error = new Error(message) as ScriptError;
+      error.stdout = stdoutChunks.join('');
+      error.stderr = stderrChunks.join('');
+      reject(error);
+    }, DEFAULT_SCRIPT_TIMEOUT_MS);
+
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      callback();
+    };
+
     const capture = (stream: 'stdout' | 'stderr', data: Buffer) => {
       const text = data.toString();
       if (stream === 'stdout') stdoutChunks.push(text);
@@ -385,7 +617,7 @@ function startSyncScript(options?: SyncRequestOptions): Promise<ScriptResult> {
 
       const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
       for (const line of lines) {
-        syncState.logs.push({ line, stream, timestamp: Date.now() });
+        syncState.logs.push({ line: sanitizeLogLine(line), stream, timestamp: Date.now() });
       }
       // limit log size to last 200 entries
       if (syncState.logs.length > 200) {
@@ -401,65 +633,61 @@ function startSyncScript(options?: SyncRequestOptions): Promise<ScriptResult> {
     }
 
     child.on('error', (error) => {
-      syncState.status = 'error';
-      syncState.error = error.message;
-      syncState.finishedAt = Date.now();
-      const scriptError = new Error(error.message) as ScriptError;
-      scriptError.stdout = stdoutChunks.join('');
-      scriptError.stderr = stderrChunks.join('');
-      syncState.logs.push({ line: error.message, stream: 'stderr', timestamp: Date.now() });
-      if (syncState.logs.length > 200) {
-        syncState.logs.splice(0, syncState.logs.length - 200);
-      }
-      reject(scriptError);
-    });
-
-    child.on('close', (code) => {
-      const stdout = stdoutChunks.join('');
-      const stderr = stderrChunks.join('');
-
-      syncState.finishedAt = Date.now();
-      if (code === 0) {
-        syncState.status = 'success';
-        resolve({ stdout, stderr });
-      } else {
-        // Extract additional error information from stderr
-        const errorLines = stderr.split('\n').filter(line => line.trim().length > 0);
-        const lastErrorLine = errorLines[errorLines.length - 1] || '';
-        
-        const baseMessage = `Sync script exited with code ${code}`;
-        const detailedMessage = lastErrorLine.includes('Error:')
-          ? `${baseMessage}: ${lastErrorLine}`
-          : `${baseMessage}: ${stderr.trim() || 'Unbekannter Fehler'}`;
-        
+      finish(() => {
         syncState.status = 'error';
-        syncState.error = detailedMessage;
-        
-        // Add detailed error information to logs
-        syncState.logs.push({ line: `FEHLER: ${baseMessage}`, stream: 'stderr', timestamp: Date.now() });
-        
-        // Add stderr content to logs for debugging (limit to last 10 lines to avoid spam)
-        const errorLogLines = errorLines.slice(-10);
-        for (const line of errorLogLines) {
-          if (line.trim()) {
-            syncState.logs.push({ line: `STDERR: ${line}`, stream: 'stderr', timestamp: Date.now() });
-          }
-        }
-        
+        syncState.error = clientMessage(error.message);
+        syncState.finishedAt = Date.now();
+        const scriptError = new Error(error.message) as ScriptError;
+        scriptError.stdout = stdoutChunks.join('');
+        scriptError.stderr = stderrChunks.join('');
+        syncState.logs.push({ line: clientMessage(error.message), stream: 'stderr', timestamp: Date.now() });
         if (syncState.logs.length > 200) {
           syncState.logs.splice(0, syncState.logs.length - 200);
         }
-        
-        const error = new Error(detailedMessage) as ScriptError;
-        error.stdout = stdout;
-        error.stderr = stderr;
-        reject(error);
-      }
+        reject(scriptError);
+      });
+    });
+
+    child.on('close', (code) => {
+      finish(() => {
+        const stdout = stdoutChunks.join('');
+        const stderr = stderrChunks.join('');
+
+        syncState.finishedAt = Date.now();
+        if (code === 0) {
+          syncState.status = 'success';
+          resolve({ stdout, stderr });
+        } else {
+          const errorLines = stderr.split('\n').filter(line => line.trim().length > 0);
+          const baseMessage = `Sync script exited with code ${code}`;
+          const detailedMessage = `${baseMessage}: ${extractUsefulError(stderr, 'Unbekannter Fehler')}`;
+          
+          syncState.status = 'error';
+          syncState.error = clientMessage(detailedMessage);
+          syncState.logs.push({ line: `FEHLER: ${baseMessage}`, stream: 'stderr', timestamp: Date.now() });
+          
+          const errorLogLines = errorLines.slice(-10);
+          for (const line of errorLogLines) {
+            if (line.trim()) {
+              syncState.logs.push({ line: `STDERR: ${sanitizeLogLine(line)}`, stream: 'stderr', timestamp: Date.now() });
+            }
+          }
+          
+          if (syncState.logs.length > 200) {
+            syncState.logs.splice(0, syncState.logs.length - 200);
+          }
+          
+          const error = new Error(detailedMessage) as ScriptError;
+          error.stdout = stdout;
+          error.stderr = stderr;
+          reject(error);
+        }
+      });
     });
   });
 }
 
-// Check if login state is valid
+// Check if login state is valid for both payments and order details.
 app.get('/api/check-login', async (req, res) => {
   try {
     const storagePath = path.join(process.cwd(), 'amazon.storageState.json');
@@ -472,6 +700,8 @@ app.get('/api/check-login', async (req, res) => {
     // Try to read and parse the file
     const content = await fs.readFile(storagePath, 'utf-8');
     JSON.parse(content); // Check if valid JSON
+    const transactionsData = await readTransactionsFile().catch(() => null);
+    const detailOrderId = chooseDetailCheckOrderId(transactionsData);
 
     // Actually test the session by trying to access Amazon
     const playwright = await import('playwright');
@@ -480,30 +710,62 @@ app.get('/api/check-login', async (req, res) => {
     const page = await context.newPage();
     
     try {
-      // Try to access the transactions page
       await page.goto('https://www.amazon.de/cpe/yourpayments/transactions', { 
         waitUntil: 'domcontentloaded',
         timeout: 10000 
       });
       
-      // Check if we're redirected to login page
-      const url = page.url();
-      const title = await page.title();
+      const paymentsUrl = page.url();
+      const paymentsTitle = await page.title();
+      const paymentsSignedOut = paymentsUrl.includes('/ap/signin') || paymentsTitle.includes('Anmeld');
+      const hasTransactions = !paymentsSignedOut
+        ? await page.$('.payWalletContentContainer, [data-testid*="transaction"]').catch(() => null)
+        : null;
+
+      const payments = {
+        valid: Boolean(!paymentsSignedOut && hasTransactions),
+        message: paymentsSignedOut
+          ? 'Zahlungsübersicht verlangt Login'
+          : hasTransactions
+            ? 'Zahlungsübersicht ist erreichbar'
+            : 'Zahlungsübersicht konnte nicht bestätigt werden'
+      };
+
+      let details = {
+        valid: false,
+        message: 'Keine Order-ID für Detailprüfung gefunden',
+        orderId: detailOrderId
+      };
       
-      if (url.includes('/ap/signin') || title.includes('Anmeld')) {
-        await browser.close();
-        return res.json({ valid: false, message: 'Amazon-Session abgelaufen (Redirect zu Login)' });
+      if (detailOrderId) {
+        const detailUrl = `https://www.amazon.de/gp/css/summary/edit.html?orderID=${encodeURIComponent(detailOrderId)}`;
+        await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => undefined);
+        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => undefined);
+        const detailCurrentUrl = page.url();
+        const detailTitle = await page.title().catch(() => '');
+        const hasLoginForm = (await page.locator('form#ap_signin_form').count().catch(() => 0)) > 0;
+        const hasOrderDetails = (await page.locator('#orderDetails, #od-container, #a-page #od-content').count().catch(() => 0)) > 0;
+        const detailSignedOut = /\/ap\/signin/i.test(detailCurrentUrl) || hasLoginForm || /(^Anmelden\b|Anmelden\s*·\s*Amazon)/i.test(detailTitle);
+        details = {
+          valid: Boolean(!detailSignedOut && hasOrderDetails),
+          message: detailSignedOut
+            ? 'Bestelldetails verlangen Reauth'
+            : hasOrderDetails
+              ? 'Bestelldetails sind erreichbar'
+              : 'Bestelldetails konnten nicht bestätigt werden',
+          orderId: detailOrderId
+        };
       }
-      
-      // Check if we can see transactions
-      const hasTransactions = await page.$('.payWalletContentContainer, [data-testid*="transaction"]').catch(() => null);
+
       await browser.close();
-      
-      if (!hasTransactions) {
-        return res.json({ valid: false, message: 'Amazon-Session möglicherweise abgelaufen' });
-      }
-      
-      res.json({ valid: true, message: 'Login-State ist gültig' });
+
+      const valid = payments.valid && details.valid;
+      const message = valid
+        ? 'Amazon-Session ist vollständig gültig'
+        : payments.valid
+          ? 'Zahlungen ok, Bestelldetails brauchen Reauth'
+          : 'Amazon-Session ist nicht vollständig gültig';
+      res.json({ valid, message, payments, details });
     } catch (error) {
       await browser.close();
       throw error;
@@ -516,33 +778,21 @@ app.get('/api/check-login', async (req, res) => {
 // Run login script
 app.post('/api/login', async (req, res) => {
   try {
-    const { stdout, stderr } = await runScript('login.ts');
-    res.json({ success: true, message: 'Login erfolgreich', output: stdout, stderr });
+    const { stdout, stderr } = await runScript('login.ts', [], { timeoutMs: LOGIN_SCRIPT_TIMEOUT_MS });
+    res.json({
+      success: true,
+      message: 'Login erfolgreich',
+      output: debugOutput(stdout),
+      stderr: debugOutput(stderr)
+    });
   } catch (error) {
     const err = error as ScriptError;
-    
-    // Enhanced login error reporting
-    const message = err.message;
-    const stdout = err.stdout || '';
-    const stderr = err.stderr || '';
-    
-    let detailedMessage = message;
-    if (stderr.includes('Error:') || stderr.includes('timeout') || stderr.includes('login')) {
-      const errorLines = stderr.split('\n').filter(line => line.trim());
-      const relevantErrors = errorLines.slice(-3).join(' ');
-      detailedMessage = `Login fehlgeschlagen: ${relevantErrors}`;
-    }
-    
+
     res.status(500).json({
       success: false,
-      message: detailedMessage,
-      output: stdout,
-      stderr: stderr,
-      debug: {
-        hasStorageState: stdout.includes('storageState') || stdout.includes('StorageState'),
-        hasTimeout: stderr.includes('timeout') || stdout.includes('timeout'),
-        hasError: stderr.includes('Error:') || stdout.includes('Error:')
-      }
+      message: `Login fehlgeschlagen: ${extractUsefulError(err.stderr, err.message)}`,
+      output: debugOutput(err.stdout || ''),
+      stderr: debugOutput(err.stderr || '')
     });
   }
 });
@@ -565,10 +815,20 @@ app.post('/api/sync', async (req, res) => {
   }
   try {
     const { stdout, stderr } = await startSyncScript(syncOptions);
-    res.json({ success: true, message: 'Sync erfolgreich', output: stdout, stderr });
+    res.json({
+      success: true,
+      message: 'Sync erfolgreich',
+      output: debugOutput(stdout),
+      stderr: debugOutput(stderr)
+    });
   } catch (error) {
     const err = error as ScriptError;
-    res.status(500).json({ success: false, message: err.message, output: err.stdout, stderr: err.stderr });
+    res.status(500).json({
+      success: false,
+      message: clientMessage(err.message),
+      output: debugOutput(err.stdout || ''),
+      stderr: debugOutput(err.stderr || '')
+    });
   }
 });
 
@@ -582,111 +842,69 @@ app.get('/api/sync-status', (req, res) => {
 });
 
 app.post('/api/delete-transactions', async (req, res) => {
-  const { orderIds } = req.body as { orderIds?: string[] };
-
-  if (!Array.isArray(orderIds) || orderIds.length === 0) {
-    return res.status(400).json({ error: 'orderIds array required' });
-  }
-
-  const ids = Array.from(
-    new Set(
-      orderIds
-        .map(id => (typeof id === 'string' ? id.trim() : ''))
-        .filter(id => id.length > 0)
-    )
-  );
-
-  if (ids.length === 0) {
-    return res.status(400).json({ error: 'orderIds array required' });
-  }
-
-  const filePath = path.join(process.cwd(), 'transactions.json');
-  const exists = await fs.access(filePath).then(() => true).catch(() => false);
-
-  if (!exists) {
-    return res.status(404).json({ error: 'transactions.json nicht gefunden' });
-  }
-
   try {
-    const raw = await fs.readFile(filePath, 'utf-8');
-    const data = JSON.parse(raw) as {
-      count: number;
-      withOrderId: number;
-      transactions: Transaction[];
-    };
+    const ids = normalizeOrderIds((req.body as { orderIds?: unknown }).orderIds, 'orderIds');
+    const result = await withTransactionsFileLock(async () => {
+      const data = await readTransactionsFile();
+      if (!data) return { missing: true as const };
 
-    const before = data.transactions?.length ?? 0;
-    const filtered = (data.transactions ?? []).filter(t => {
-      if (!t.orderId) return true;
-      return !ids.includes(t.orderId);
+      const before = data.transactions.length;
+      const filtered = data.transactions.filter(t => !t.orderId || !ids.includes(t.orderId));
+      const removed = before - filtered.length;
+
+      if (removed === 0) {
+        return { missing: false as const, removed: 0, count: data.count, withOrderId: data.withOrderId };
+      }
+
+      const updated = validateTransactionsData({ ...data, transactions: filtered });
+      await writeFileAtomic(TRANSACTIONS_FILE, JSON.stringify(updated, null, 2));
+      return { missing: false as const, removed, count: updated.count, withOrderId: updated.withOrderId };
     });
-    const removed = before - filtered.length;
 
-    if (removed === 0) {
-      return res.json({ success: true, removed: 0, count: data.count, withOrderId: data.withOrderId });
+    if (result.missing) {
+      return res.status(404).json({ error: 'transactions.json nicht gefunden' });
     }
-
-    const updated = {
-      count: filtered.length,
-      withOrderId: filtered.filter(t => !!t.orderId).length,
-      transactions: filtered
-    };
-
-    await fs.writeFile(filePath, JSON.stringify(updated, null, 2), 'utf8');
-
-    res.json({ success: true, removed, count: updated.count, withOrderId: updated.withOrderId });
+    res.json({ success: true, removed: result.removed, count: result.count, withOrderId: result.withOrderId });
   } catch (error) {
     console.error('Fehler beim Löschen von Transaktionen', error);
-    res.status(500).json({ error: 'Fehler beim Löschen von Transaktionen' });
+    const status = isClientInputError(error) ? 400 : 500;
+    res.status(status).json({ error: error instanceof Error ? clientMessage(error.message) : 'Fehler beim Löschen von Transaktionen' });
   }
 });
 
 app.post('/api/reset-ynab-status', async (req, res) => {
-  const { orderIds } = req.body as { orderIds?: string[] };
-
-  if (!Array.isArray(orderIds) || orderIds.length === 0) {
-    return res.status(400).json({ error: 'orderIds array required' });
-  }
-
-  const ids = Array.from(new Set(orderIds.filter(id => typeof id === 'string' && id.trim().length > 0).map(id => id.trim())));
-  if (ids.length === 0) {
-    return res.status(400).json({ error: 'orderIds array required' });
-  }
-
-  const filePath = path.join(process.cwd(), 'transactions.json');
-  const exists = await fs.access(filePath).then(() => true).catch(() => false);
-  if (!exists) {
-    return res.status(404).json({ error: 'transactions.json nicht gefunden' });
-  }
-
   try {
-    const raw = await fs.readFile(filePath, 'utf8');
-    const data = JSON.parse(raw) as {
-      count: number;
-      withOrderId: number;
-      transactions: Transaction[];
-    };
+    const ids = normalizeOrderIds((req.body as { orderIds?: unknown }).orderIds, 'orderIds');
+    const result = await withTransactionsFileLock(async () => {
+      const data = await readTransactionsFile();
+      if (!data) return { missing: true as const };
 
-    let touched = 0;
-    for (const t of data.transactions) {
-      if (t.orderId && ids.includes(t.orderId)) {
-        if (t.ynabSynced || t.ynabSync) {
-          touched++;
+      let touched = 0;
+      for (const t of data.transactions) {
+        if (t.orderId && ids.includes(t.orderId)) {
+          if (t.ynabSynced || t.ynabSync) {
+            touched++;
+          }
+          t.ynabSynced = false;
+          delete (t as any).ynabSync;
         }
-        t.ynabSynced = false;
-        delete (t as any).ynabSync;
       }
-    }
 
-    if (touched === 0) {
-      return res.json({ success: true, updated: 0 });
-    }
+      if (touched > 0) {
+        const updated = validateTransactionsData(data);
+        await writeFileAtomic(TRANSACTIONS_FILE, JSON.stringify(updated, null, 2));
+      }
+      return { missing: false as const, updated: touched };
+    });
 
-    await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
-    res.json({ success: true, updated: touched });
+    if (result.missing) {
+      return res.status(404).json({ error: 'transactions.json nicht gefunden' });
+    }
+    res.json({ success: true, updated: result.updated });
   } catch (error) {
     console.error('Fehler beim Zurücksetzen des YNAB-Status', error);
-    res.status(500).json({ error: 'Fehler beim Zurücksetzen des YNAB-Status' });
+    const status = isClientInputError(error) ? 400 : 500;
+    res.status(status).json({ error: error instanceof Error ? clientMessage(error.message) : 'Fehler beim Zurücksetzen des YNAB-Status' });
   }
 });
 
@@ -695,6 +913,10 @@ app.post('/api/ai-summary', async (req, res) => {
 
   if (!text || typeof text !== 'string') {
     return res.status(400).json({ error: 'Feld "text" ist erforderlich.' });
+  }
+
+  if (text.length > MAX_AI_INPUT_LENGTH) {
+    return res.status(413).json({ error: `Text ist zu lang (max. ${MAX_AI_INPUT_LENGTH} Zeichen).` });
   }
 
   if (!openai) {
@@ -727,42 +949,41 @@ app.post('/api/ai-summary', async (req, res) => {
 app.post('/api/update-ai-summary', async (req, res) => {
   const { orderId, aiSummary } = req.body as { orderId?: string; aiSummary?: string };
 
-  if (!orderId || typeof orderId !== 'string') {
+  if (!orderId || typeof orderId !== 'string' || orderId.length > MAX_ORDER_ID_LENGTH) {
     return res.status(400).json({ error: 'orderId ist erforderlich.' });
   }
 
-  if (aiSummary !== undefined && typeof aiSummary !== 'string') {
+  if (aiSummary !== undefined && (typeof aiSummary !== 'string' || aiSummary.length > SUMMARY_MAX_LENGTH)) {
     return res.status(400).json({ error: 'aiSummary muss ein String sein.' });
   }
 
-  const filePath = path.join(process.cwd(), 'transactions.json');
-  const exists = await fs.access(filePath).then(() => true).catch(() => false);
-  if (!exists) {
-    return res.status(404).json({ error: 'transactions.json nicht gefunden' });
-  }
-
   try {
-    const raw = await fs.readFile(filePath, 'utf8');
-    const data = JSON.parse(raw) as {
-      count: number;
-      withOrderId: number;
-      transactions: Transaction[];
-    };
+    const result = await withTransactionsFileLock(async () => {
+      const data = await readTransactionsFile();
+      if (!data) return { missing: true as const, updated: false };
 
-    let updated = false;
-    for (const t of data.transactions) {
-      if (t.orderId === orderId) {
-        t.aiSummary = aiSummary || null;
-        updated = true;
-        break;
+      let updated = false;
+      for (const t of data.transactions) {
+        if (t.orderId === orderId.trim()) {
+          t.aiSummary = aiSummary || null;
+          updated = true;
+          break;
+        }
       }
-    }
 
-    if (!updated) {
+      if (updated) {
+        const next = validateTransactionsData(data);
+        await writeFileAtomic(TRANSACTIONS_FILE, JSON.stringify(next, null, 2));
+      }
+      return { missing: false as const, updated };
+    });
+
+    if (result.missing) {
+      return res.status(404).json({ error: 'transactions.json nicht gefunden' });
+    }
+    if (!result.updated) {
       return res.status(404).json({ error: 'Transaktion mit dieser orderId nicht gefunden.' });
     }
-
-    await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
     res.json({ success: true });
   } catch (error) {
     console.error('Fehler beim Aktualisieren der AI-Summary', error);
@@ -773,17 +994,13 @@ app.post('/api/update-ai-summary', async (req, res) => {
 // Get transactions
 app.get('/api/transactions', async (req, res) => {
   try {
-    const filePath = path.join(process.cwd(), 'transactions.json');
-    const exists = await fs.access(filePath).then(() => true).catch(() => false);
-
-    if (!exists) {
+    const data = await readTransactionsFile();
+    if (!data) {
       return res.json({ transactions: [], count: 0, withOrderId: 0 });
     }
-
-    const content = await fs.readFile(filePath, 'utf-8');
-    const data = JSON.parse(content);
     res.json(data);
   } catch (error) {
+    console.error('Fehler beim Laden der Transaktionen', error);
     res.status(500).json({ error: 'Fehler beim Laden der Transaktionen' });
   }
 });
@@ -811,39 +1028,39 @@ app.post('/api/sync-ynab', async (req, res) => {
       });
     }
 
-    const { transactionIds }: { transactionIds: string[] } = req.body;
-
-    if (!transactionIds || !Array.isArray(transactionIds)) {
-      return res.status(400).json({ error: 'transactionIds array required' });
+    let uniqueIds: string[];
+    try {
+      uniqueIds = normalizeOrderIds((req.body as { transactionIds?: unknown }).transactionIds, 'transactionIds');
+    } catch (error) {
+      const message = error instanceof Error ? clientMessage(error.message) : 'transactionIds array required';
+      return res.status(400).json({ success: false, message });
     }
-
-    const uniqueIds = Array.from(
-      new Set(
-        transactionIds
-          .filter((id) => typeof id === 'string')
-          .map((id) => id.trim())
-          .filter((id) => id.length > 0)
-      )
-    );
 
     const args: string[] = [];
-    if (uniqueIds.length > 0) {
-      args.push('--orders', JSON.stringify(uniqueIds));
-    }
+    args.push('--orders', JSON.stringify(uniqueIds));
 
     console.log('[API] /api/sync-ynab angefordert', {
       requested: uniqueIds.length,
       sample: uniqueIds.slice(0, 10)
     });
 
-    const { stdout, stderr } = await runScript('ynab-sync.ts', args);
+    const { stdout, stderr } = await runScript('ynab-sync.ts', args, {
+      timeoutMs: YNAB_SCRIPT_TIMEOUT_MS,
+      env: buildYnabScriptEnv()
+    });
     const { summary, cleanedStdout } = extractYnabSummary(stdout);
 
     if (summary) {
       console.log('[API] YNAB Sync Summary', summary);
     }
 
-    res.json({ success: true, message: 'YNAB Sync erfolgreich', output: cleanedStdout, stderr: stderr.trim(), summary });
+    res.json({
+      success: true,
+      message: 'YNAB Sync erfolgreich',
+      output: debugOutput(cleanedStdout),
+      stderr: debugOutput(stderr),
+      summary
+    });
   } catch (error) {
     const err = error as ScriptError;
     const { summary, cleanedStdout } = extractYnabSummary(err.stdout || '');
@@ -852,46 +1069,20 @@ app.post('/api/sync-ynab', async (req, res) => {
       console.error('[API] YNAB Sync Fehlerzusammenfassung', summary);
     }
 
-    // Enhanced error reporting for YNAB sync
-    const errorMessage = err.message;
     const stderrLines = (err.stderr || '').split('\n').filter(line => line.trim().length > 0);
-    const lastErrorLine = stderrLines[stderrLines.length - 1] || '';
-    
-    // More detailed error analysis
-    let detailedError = errorMessage;
-    if (lastErrorLine && !lastErrorLine.includes('Script exited with code')) {
-      detailedError = `${errorMessage}: ${lastErrorLine}`;
-    } else if (stderrLines.length > 0) {
-      // Look for specific YNAB error patterns
-      const ynabErrorPatterns = [
-        /YNAB HTTP (\d+):/,
-        /bitte.*setzen/i,
-        /token/i,
-        /budget/i,
-        /account/i,
-        /permission/i
-      ];
-      
-      for (const pattern of ynabErrorPatterns) {
-        const match = stderrLines.join(' ').match(pattern);
-        if (match) {
-          detailedError = `${errorMessage}: ${match[0]}`;
-          break;
-        }
-      }
-    }
+    const detailedError = extractUsefulError(err.stderr, err.message);
     
     res.status(500).json({
       success: false,
       message: detailedError,
-      output: cleanedStdout,
-      stderr: (err.stderr || '').trim(),
+      output: debugOutput(cleanedStdout),
+      stderr: debugOutput(err.stderr || ''),
       summary,
-      debug: {
+      debug: API_DEBUG_OUTPUT ? {
         code: err.message.includes('code 1') ? 1 : undefined,
-        stderrLines: stderrLines.slice(-5), // Last 5 error lines
+        stderrLines: stderrLines.slice(-5).map(sanitizeLogLine),
         hasYnabError: stderrLines.some(line => /YNAB|HTTP|token|budget|account/i.test(line))
-      }
+      } : undefined
     });
   }
 });
@@ -900,8 +1091,11 @@ app.post('/api/sync-ynab', async (req, res) => {
 async function startServer() {
   await checkPlaywrightInstallation();
   
-  app.listen(PORT, () => {
-    console.log(`Server läuft auf Port ${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`Server läuft auf http://${HOST}:${PORT}`);
+    if (!API_AUTH_TOKEN) {
+      console.warn('API_AUTH_TOKEN ist nicht gesetzt; API-Schutz ist deaktiviert.');
+    }
   });
 }
 

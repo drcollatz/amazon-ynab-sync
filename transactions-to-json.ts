@@ -3,6 +3,7 @@
 import { chromium, devices } from "playwright";
 import type { Page } from "playwright";
 import OpenAI from "openai";
+import { mergeTransactions, parseGermanDateToISO, transactionKey } from "./ynab-utils";
 
 type Transaction = {
   date: string | null;
@@ -21,6 +22,8 @@ type Transaction = {
   totalAmount?: string | null;              // total amount across all orders (for multi-order transactions)
   orderIndex?: number;                      // index of this order in multi-order transaction (0-based)
   totalOrders?: number;                     // total number of orders in multi-order transaction
+  detailsStatus?: 'ok' | 'reauth-required' | 'not-found';
+  detailsCheckedAt?: string;
 };
 
 type OrderItem = {
@@ -37,13 +40,19 @@ type OrderSummary = {
   total?: string | null;
 };
 
-type SyncMode = 'current-month' | 'last-n' | 'date-range';
+type SyncMode = 'current-month' | 'newest' | 'last-n' | 'date-range';
 
 type CliOptions = {
   mode: SyncMode;
   lastCount?: number;
   startDate?: string;
   endDate?: string;
+};
+
+type Persisted = {
+  count: number;
+  withOrderId: number;
+  transactions: Transaction[];
 };
 
 const monthMap: { [key: string]: number } = {
@@ -57,6 +66,9 @@ const DETAILS_URL = (orderId: string) => `${BASE}/gp/your-account/order-details?
 
 const HEADLESS = true;              // set false for debugging
 const BLOCK_RESOURCES = true;       // block heavy resources for speed
+const DEBUG_SCRAPER = process.env.DEBUG_SCRAPER === '1';
+const MAX_LOAD_MORE_CLICKS = Number(process.env.MAX_LOAD_MORE_CLICKS || 8);
+const MAX_TRANSACTION_SCROLL_STEPS = Number(process.env.MAX_TRANSACTION_SCROLL_STEPS || 80);
 
 const sanitize = (s?: string | null) => (s ?? "").replace(/\s+/g, " ").trim() || null;
 
@@ -71,7 +83,7 @@ function parseCliOptions(argv: string[]): CliOptions {
     switch (arg) {
       case '--mode': {
         const value = argv[i + 1];
-        if (value === 'current-month' || value === 'last-n' || value === 'date-range') {
+        if (value === 'current-month' || value === 'newest' || value === 'last-n' || value === 'date-range') {
           options.mode = value;
         }
         i++;
@@ -141,14 +153,9 @@ function formatOrderDescription(items?: OrderItem[] | null, titles?: string[] | 
 
 function parseGermanDate(dateStr: string | null): Date | null {
   if (!dateStr) return null;
-  const match = dateStr.match(/(\d{1,2})\.\s*(\w+)\s*(\d{4})/);
-  if (!match) return null;
-  const day = parseInt(match[1], 10);
-  const monthName = match[2];
-  const year = parseInt(match[3], 10);
-  const month = monthMap[monthName];
-  if (month === undefined) return null;
-  return new Date(year, month, day);
+  const isoDate = parseGermanDateToISO(dateStr);
+  if (!isoDate) return null;
+  return new Date(`${isoDate}T00:00:00`);
 }
 
 // Helper to check if a transaction date is in the current month
@@ -160,17 +167,55 @@ function isCurrentMonth(dateStr: string | null): boolean {
 }
 
 function isWithinRange(dateStr: string | null, start?: string, end?: string): boolean {
-  const date = parseGermanDate(dateStr);
-  if (!date) return false;
-  if (start) {
-    const startDate = new Date(start);
-    if (!Number.isNaN(startDate.getTime()) && date < startDate) return false;
-  }
-  if (end) {
-    const endDate = new Date(end);
-    if (!Number.isNaN(endDate.getTime()) && date > endDate) return false;
-  }
+  if (!dateStr) return false;
+  const isoDate = parseGermanDateToISO(dateStr);
+  if (!isoDate) return false;
+  if (start && isoDate < start) return false;
+  if (end && isoDate > end) return false;
   return true;
+}
+
+function loadExistingTransactions(filePath = "transactions.json"): Transaction[] {
+  const fs = require("fs") as typeof import("fs");
+  if (!fs.existsSync(filePath)) return [];
+  try {
+    const existing = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Persisted;
+    return Array.isArray(existing.transactions) ? existing.transactions : [];
+  } catch (error) {
+    console.warn("Bestehende transactions.json konnte nicht für Neuste-Einträge-Filter gelesen werden.", error);
+    return [];
+  }
+}
+
+function filterNewestTransactions(transactions: Transaction[]): Transaction[] {
+  const existing = loadExistingTransactions();
+  if (existing.length === 0) {
+    console.log("[Neuste Einträge] Keine bestehende transactions.json gefunden – übernehme alle sichtbaren Einträge.");
+    return transactions;
+  }
+
+  const syncedKeys = new Set(
+    existing
+      .filter((transaction: any) => Boolean(transaction.ynabSynced))
+      .map(transactionKey)
+  );
+
+  if (syncedKeys.size === 0) {
+    console.log("[Neuste Einträge] Keine bereits mit YNAB synchronisierte Referenz gefunden – übernehme alle sichtbaren Einträge.");
+    return transactions;
+  }
+
+  const newest: Transaction[] = [];
+  for (const transaction of transactions) {
+    if (syncedKeys.has(transactionKey(transaction))) {
+      console.log(`[Neuste Einträge] Stoppe bei bereits YNAB-synchronisiertem Eintrag: ${transaction.orderId ?? transaction.date ?? "ohne ID"}`);
+      break;
+    }
+    newest.push(transaction);
+  }
+
+  console.log(`[Neuste Einträge] ${newest.length} sichtbare Einträge seit der letzten YNAB-Synchronisierung gefunden.`);
+  return newest;
 }
 
 // Detect typical login page strings – we never want to persist those as titles/descriptions
@@ -224,6 +269,8 @@ async function generateSummary(description: string): Promise<string | null> {
 
 function applySyncFilters(transactions: Transaction[], options: CliOptions): Transaction[] {
   switch (options.mode) {
+    case 'newest':
+      return filterNewestTransactions(transactions);
     case 'last-n': {
       const count = Math.max(options.lastCount ?? 20, 1);
       return transactions.slice(0, count);
@@ -253,6 +300,144 @@ async function slowScroll(page: Page) {
       }, 120);
     });
   });
+}
+
+type TransactionLink = { text: string; href: string };
+
+function parseTransactionDateFromText(text: string): Date | null {
+  const match = text.match(/(\d{1,2}\.\s*(Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)\s+\d{4})/i);
+  return match ? parseGermanDate(match[1]) : null;
+}
+
+function transactionKeysFromLinkText(text: string): string[] {
+  const dateMatch = text.match(/(\d{1,2}\.\s*(Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)\s+\d{4})/i);
+  const date = dateMatch ? dateMatch[1] : null;
+  const amountMatch = text.match(/([+-]?€\d+[.,]\d{2})/);
+  const amount = amountMatch ? amountMatch[1] : null;
+  const orderIds = Array.from(text.matchAll(/Bestellnummer\s+([0-9-]+)/g)).map((match) => match[1].replace(/-+$/, ''));
+  if (orderIds.length === 0) return [];
+  if (orderIds.length === 1) {
+    return [transactionKey({ orderId: orderIds[0], amount, date })];
+  }
+  return orderIds.map((orderId, orderIndex) => transactionKey({
+    orderId,
+    amount: null,
+    totalAmount: amount,
+    date,
+    multiOrderTransaction: true,
+    orderIndex
+  }));
+}
+
+function shouldStopCollecting(collected: TransactionLink[], options: CliOptions, syncedKeys?: Set<string>): boolean {
+  if (options.mode === 'current-month') return true;
+  if (options.mode === 'last-n') {
+    return collected.length >= Math.max(options.lastCount ?? 20, 1);
+  }
+  if (options.mode === 'date-range' && options.startDate) {
+    const startTime = Date.parse(options.startDate);
+    if (!Number.isNaN(startTime)) {
+      return collected.some((link) => {
+        const date = parseTransactionDateFromText(link.text);
+        return date ? date.getTime() < startTime : false;
+      });
+    }
+  }
+  if (options.mode === 'newest' && syncedKeys?.size) {
+    return collected.some((link) => transactionKeysFromLinkText(link.text).some((key) => syncedKeys.has(key)));
+  }
+  return false;
+}
+
+async function collectTransactionLinks(page: Page, options: CliOptions): Promise<TransactionLink[]> {
+  const collected = new Map<string, TransactionLink>();
+  const syncedKeys = options.mode === 'newest'
+    ? new Set(loadExistingTransactions().filter((transaction: any) => Boolean(transaction.ynabSynced)).map(transactionKey))
+    : undefined;
+  const maxSteps = options.mode === 'current-month' ? 1 : MAX_TRANSACTION_SCROLL_STEPS;
+  let stableSteps = 0;
+  let lastUniqueCount = 0;
+
+  for (let step = 0; step < maxSteps; step += 1) {
+    const result = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a'))
+        .map((link) => ({ text: (link.textContent || '').trim(), href: (link as HTMLAnchorElement).href }))
+        .filter((link) => link.text.includes('Bestellnummer'));
+
+      const candidates = Array.from(document.querySelectorAll('body *'))
+        .map((el) => {
+          const style = getComputedStyle(el);
+          const orderCount = Array.from(el.querySelectorAll('a')).filter((link) => (link.textContent || '').includes('Bestellnummer')).length;
+          return {
+            el,
+            overflowY: style.overflowY,
+            orderCount,
+            delta: el.scrollHeight - el.clientHeight,
+            scrollTop: el.scrollTop,
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight
+          };
+        })
+        .filter((candidate) => candidate.orderCount > 0 && candidate.delta > 50 && /(auto|scroll)/.test(candidate.overflowY))
+        .sort((a, b) => (b.orderCount - a.orderCount) || (b.delta - a.delta));
+
+      const target = candidates[0]?.el;
+      const scrollInfo = target
+        ? {
+            beforeTop: target.scrollTop,
+            scrollHeight: target.scrollHeight,
+            clientHeight: target.clientHeight
+          }
+        : null;
+
+      if (target) {
+        target.scrollTop += Math.max(400, Math.floor(target.clientHeight * 0.85));
+        target.dispatchEvent(new Event('scroll', { bubbles: true }));
+      }
+
+      return { links, scrollInfo };
+    });
+
+    for (const link of result.links) {
+      collected.set(`${link.text}|${link.href}`, link);
+    }
+
+    const collectedLinks = Array.from(collected.values());
+    if (shouldStopCollecting(collectedLinks, options, syncedKeys)) {
+      console.log(`   Transaktionsliste eingesammelt: ${collectedLinks.length} eindeutige Zeilen.`);
+      return collectedLinks;
+    }
+
+    if (collected.size === lastUniqueCount) {
+      stableSteps += 1;
+    } else {
+      stableSteps = 0;
+      lastUniqueCount = collected.size;
+    }
+
+    if (!result.scrollInfo) {
+      console.log(`   Kein innerer Transaktions-Scrollcontainer gefunden (${collected.size} Zeilen).`);
+      break;
+    }
+
+    const reachedBottom = result.scrollInfo.beforeTop + result.scrollInfo.clientHeight >= result.scrollInfo.scrollHeight - 4;
+    if (reachedBottom && stableSteps >= 4) {
+      console.log(`   Ende der Transaktionsliste erreicht (${collected.size} eindeutige Zeilen).`);
+      break;
+    }
+
+    if (stableSteps >= 12) {
+      console.warn(`   Keine neuen Transaktionszeilen nach ${stableSteps} Scroll-Schritten (${collected.size} eindeutig).`);
+      break;
+    }
+
+    await page.waitForTimeout(900);
+  }
+
+  if (collected.size >= lastUniqueCount && maxSteps > 1) {
+    console.warn(`   Maximale Scroll-Schritte erreicht (${MAX_TRANSACTION_SCROLL_STEPS}, ${collected.size} eindeutige Zeilen).`);
+  }
+  return Array.from(collected.values());
 }
 
 /** Extract transactions from first page with dynamic limit */
@@ -332,129 +517,75 @@ async function extractTransactions(page: Page, options: CliOptions): Promise<Tra
   console.log(`Using selector: ${foundSelector} for transaction extraction`);
 
   console.log("   Lese DOM und parsiere Transaktionen...");
-  const maxEntries = options.mode === 'last-n'
-    ? Math.max(options.lastCount ?? 20, 1)
-    : 500;
 
-  // Enhanced debug mode - let's see what we're actually working with!
-  const debugInfo = await page.evaluate((selector) => {
-    const results: any[] = [];
-    const elements = document.querySelectorAll(selector);
-    
-    console.log(`[DEBUG] Found ${elements.length} elements with selector: ${selector}`);
-    
-    elements.forEach((el, idx) => {
-      const debug = {
-        index: idx,
-        tagName: el.tagName,
-        className: el.className,
-        id: el.id,
-        textContent: (el.textContent || "").substring(0, 200),
-        outerHTML: (el.outerHTML || "").substring(0, 500),
-        children: el.children.length,
-        childTags: Array.from(el.children).map(child => ({
-          tag: child.tagName,
-          class: child.className,
-          text: (child.textContent || "").trim().substring(0, 50)
-        })),
-        hrefs: Array.from(el.querySelectorAll('a[href]')).map(a => ({
-          href: (a as HTMLAnchorElement).href,
-          text: (a.textContent || "").trim()
-        })),
-        amounts: Array.from(el.querySelectorAll('.a-size-base-plus, .a-text-bold, [class*="price"], [class*="amount"]')).map(a => ({
-          text: (a.textContent || "").trim(),
-          class: a.className
-        })),
-        dates: Array.from(el.querySelectorAll('[class*="date"], [class*="zeit"], time')).map(d => ({
-          text: (d.textContent || "").trim(),
-          class: d.className
-        })),
-        merchants: Array.from(el.querySelectorAll('.a-size-base:not(.a-text-bold), [class*="merchant"], [class*="seller"]')).map(m => ({
-          text: (m.textContent || "").trim(),
-          class: m.className
-        }))
-      };
-      results.push(debug);
-    });
-    
-    return results;
-  }, foundSelector);
+  if (DEBUG_SCRAPER) {
+    const debugInfo = await page.evaluate((selector) => {
+      const results: any[] = [];
+      const elements = document.querySelectorAll(selector);
+      
+      elements.forEach((el, idx) => {
+        const debug = {
+          index: idx,
+          tagName: el.tagName,
+          className: el.className,
+          id: el.id,
+          textContent: (el.textContent || "").substring(0, 200),
+          outerHTML: (el.outerHTML || "").substring(0, 500),
+          children: el.children.length,
+          childTags: Array.from(el.children).map(child => ({
+            tag: child.tagName,
+            class: child.className,
+            text: (child.textContent || "").trim().substring(0, 50)
+          })),
+          hrefs: Array.from(el.querySelectorAll('a[href]')).map(a => ({
+            href: (a as HTMLAnchorElement).href,
+            text: (a.textContent || "").trim()
+          })),
+          amounts: Array.from(el.querySelectorAll('.a-size-base-plus, .a-text-bold, [class*="price"], [class*="amount"]')).map(a => ({
+            text: (a.textContent || "").trim(),
+            class: a.className
+          })),
+          dates: Array.from(el.querySelectorAll('[class*="date"], [class*="zeit"], time')).map(d => ({
+            text: (d.textContent || "").trim(),
+            class: d.className
+          })),
+          merchants: Array.from(el.querySelectorAll('.a-size-base:not(.a-text-bold), [class*="merchant"], [class*="seller"]')).map(m => ({
+            text: (m.textContent || "").trim(),
+            class: m.className
+          }))
+        };
+        results.push(debug);
+      });
+      
+      return results;
+    }, foundSelector);
 
-  console.log("[DEBUG] Detailed DOM analysis of found elements:");
-  debugInfo.forEach((debug, idx) => {
-    console.log(`\n=== ELEMENT ${idx + 1} ===`);
-    console.log(`Tag: ${debug.tagName}, Class: ${debug.className}`);
-    console.log(`Text content: ${debug.textContent}`);
-    console.log(`Children: ${debug.children}`);
-    console.log("Child elements:");
-    debug.childTags.forEach((child: any) => {
-      console.log(`  - <${child.tag} class="${child.class}">${child.text}</>`);
+    console.log("[DEBUG] Detailed DOM analysis of found elements:");
+    debugInfo.forEach((debug, idx) => {
+      console.log(`\n=== ELEMENT ${idx + 1} ===`);
+      console.log(`Tag: ${debug.tagName}, Class: ${debug.className}`);
+      console.log(`Text content: ${debug.textContent}`);
+      console.log(`Children: ${debug.children}`);
+      console.log("Child elements:");
+      debug.childTags.forEach((child: any) => {
+        console.log(`  - <${child.tag} class="${child.class}">${child.text}</>`);
+      });
+      if (debug.hrefs.length > 0) {
+        console.log("Links found:");
+        debug.hrefs.forEach((href: any) => {
+          console.log(`  - "${href.text}" -> ${href.href}`);
+        });
+      }
+      console.log("Raw HTML snippet (first 500 chars):");
+      console.log(debug.outerHTML);
     });
-    if (debug.hrefs.length > 0) {
-      console.log("Links found:");
-      debug.hrefs.forEach((href: any) => {
-        console.log(`  - "${href.text}" -> ${href.href}`);
-      });
-    }
-    if (debug.amounts.length > 0) {
-      console.log("Amount candidates:");
-      debug.amounts.forEach((amount: any) => {
-        console.log(`  - "${amount.text}" (class: ${amount.class})`);
-      });
-    }
-    if (debug.dates.length > 0) {
-      console.log("Date candidates:");
-      debug.dates.forEach((date: any) => {
-        console.log(`  - "${date.text}" (class: ${date.class})`);
-      });
-    }
-    if (debug.merchants.length > 0) {
-      console.log("Merchant candidates:");
-      debug.merchants.forEach((merchant: any) => {
-        console.log(`  - "${merchant.text}" (class: ${merchant.class})`);
-      });
-    }
-    console.log("Raw HTML snippet (first 1000 chars):");
-    console.log(debug.outerHTML);
-  });
-  
-  console.log("\n[DEBUG] RECOMMENDATIONS:");
-  console.log("Based on the analysis above, modify the transaction selectors in the code:");
-  console.log("- For amounts: look for .a-size-base-plus, .a-text-bold, [class*='price']");
-  console.log("- For dates: look for [class*='date'], [class*='zeit'], time elements");
-  console.log("- For merchants: look for .a-size-base:not(.a-text-bold), [class*='merchant']");
-  console.log("- For order IDs: look for a[href*='orderID'] links");
-  console.log("Update the $eval function to use the correct selectors based on this analysis.");
+  }
 
   // Parse transaction data from link texts (Amazon format) 
   console.log("[TRANSACTION] Starting transaction parsing from link texts...");
   let txs: any[] = [];
   try {
-    // Use the same selector as the debug analysis to find the right elements
-    const linkTexts = await page.evaluate((selector) => {
-      const results: Array<{text: string, href: string}> = [];
-      const elements = document.querySelectorAll(selector);
-      
-      console.log(`[TRANSACTION] Analyzing ${elements.length} elements with selector: ${selector}`);
-      
-      elements.forEach((el, idx) => {
-        const links = el.querySelectorAll('a[href*="#"]'); // Filter for transaction links
-        console.log(`[TRANSACTION] Element ${idx + 1} has ${links.length} potential transaction links`);
-        
-        links.forEach((link) => {
-          const text = (link.textContent || "").trim();
-          const href = (link as HTMLAnchorElement).href;
-          // Only include links that look like transaction entries
-          if (text && href && text.includes('Bestellnummer')) {
-            console.log(`[TRANSACTION] Found transaction link: "${text.substring(0, 100)}..."`);
-            results.push({text, href});
-          }
-        });
-      });
-      
-      console.log(`[TRANSACTION] Filtered to ${results.length} transaction links`);
-      return results;
-    }, foundSelector);
+    const linkTexts = await collectTransactionLinks(page, options);
     
     console.log(`[TRANSACTION] Found ${linkTexts.length} total transaction links to process`);
     
@@ -580,10 +711,11 @@ type OrderDetailResult = {
   titles: string[] | null;
   items: OrderItem[] | null;
   summary: OrderSummary | null;
+  status: 'ok' | 'reauth-required' | 'not-found';
 };
 
 /** Fetch product titles from order detail page (strictly scoped to #orderDetails) */
-async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string | null): Promise<OrderDetailResult | null> {
+async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string | null): Promise<OrderDetailResult> {
   const label = `order:${orderId}`;
   console.time(label);
 
@@ -615,7 +747,14 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
     console.warn(`   TITLE: ${title}`);
     console.warn(`   HINWEIS: Die Amazon-Session ist möglicherweise abgelaufen. Führe 'npm run login' erneut aus.`);
     console.timeEnd(label);
-    return null;
+    return {
+      titles: null,
+      items: null,
+      summary: null,
+      status: (/\/ap\/signin/i.test(currentUrl) || hasLoginForm || /(^Anmelden\b|Anmelden\s*·\s*Amazon)/i.test(title))
+        ? 'reauth-required'
+        : 'not-found'
+    };
   }
 
   await ensureNoCaptcha(page, `Bestelldetails (${orderId})`);
@@ -830,13 +969,15 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
     };
   });
 
-  console.log(`   Selektor-Treffer (${orderId} @ ${foundRoot}): ${debugSelectors.map((d: any) => {
-    let info = `${d.selector}:${d.hits}`;
-    if (d.qtyDivs !== undefined) info += ` [${d.qtyDivs} qty-divs]`;
-    if (d.quantities) info += ` (${d.quantities})`;
-    return info;
-  }).join(", ")}`);
-  if (titles.length === 0 && rootSnippet) {
+  if (DEBUG_SCRAPER) {
+    console.log(`   Selektor-Treffer (${orderId} @ ${foundRoot}): ${debugSelectors.map((d: any) => {
+      let info = `${d.selector}:${d.hits}`;
+      if (d.qtyDivs !== undefined) info += ` [${d.qtyDivs} qty-divs]`;
+      if (d.quantities) info += ` (${d.quantities})`;
+      return info;
+    }).join(", ")}`);
+  }
+  if (DEBUG_SCRAPER && titles.length === 0 && rootSnippet) {
     console.log(`   [Debug] Root-Ausschnitt (${orderId}): ${rootSnippet}`);
   }
 
@@ -891,7 +1032,8 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
   return {
     titles: unique.length ? unique : null,
     items: normalizedItems.length ? normalizedItems : null,
-    summary: (normalizedSummary.voucher || normalizedSummary.bonusPoints || normalizedSummary.total) ? normalizedSummary : null
+    summary: (normalizedSummary.voucher || normalizedSummary.bonusPoints || normalizedSummary.total) ? normalizedSummary : null,
+    status: 'ok'
   };
 }
 
@@ -899,7 +1041,7 @@ async function fetchOrderTitles(page: Page, orderId: string, orderUrl?: string |
 async function setupRequestBlocking(page: Page) {
   await page.route("**/*", (route) => {
     const type = route.request().resourceType();
-    if (type === "image" || type === "media" || type === "font" || type === "stylesheet") {
+    if (type === "image" || type === "media" || type === "font") {
       return route.abort();
     }
     return route.continue();
@@ -959,9 +1101,9 @@ async function main() {
     }
     console.log(`   [Detail] Lade Titel für ${tx.orderId} (${tx.date ?? "kein Datum"})...`);
     const detail = await fetchOrderTitles(page, tx.orderId, tx.orderUrl ?? null);
-    const rawTitles = detail?.titles ?? null;
-    const rawItems = detail?.items ?? null;
-    const orderSummary = detail?.summary ?? null;
+    const rawTitles = detail.titles;
+    const rawItems = detail.items;
+    const orderSummary = detail.summary;
 
     const cleanedTitles = rawTitles ? rawTitles.filter((t) => !/Anmelden/i.test(t)) : null;
     const dedupedTitles = cleanedTitles ? Array.from(new Set(cleanedTitles)) : null;
@@ -980,13 +1122,17 @@ async function main() {
 
     const related = transactions.filter(t => t.orderId === tx.orderId);
     for (const r of related) {
-      r.orderItems = cleanedItems;
-      r.orderTitles = dedupedTitles;
-      r.orderDescription = formattedDescription;
-      r.orderSummary = orderSummary;
+      if (detail.status === 'ok') {
+        r.orderItems = cleanedItems;
+        r.orderTitles = dedupedTitles;
+        r.orderDescription = formattedDescription;
+        r.orderSummary = orderSummary;
+      }
+      r.detailsStatus = detail.status;
+      r.detailsCheckedAt = new Date().toISOString();
       scrubLoginFields(r);
       // Generate AI summary for YNAB memo
-      if (formattedDescription) {
+      if (detail.status === 'ok' && formattedDescription) {
         r.aiSummary = await generateSummary(formattedDescription);
       }
     }
@@ -1008,12 +1154,6 @@ async function main() {
   const fs = await import("fs");
   const path = "transactions.json";
 
-  type Persisted = {
-    count: number;
-    withOrderId: number;
-    transactions: Transaction[];
-  };
-
   let existing: Persisted | null = null;
   if (fs.existsSync(path)) {
     try {
@@ -1023,71 +1163,16 @@ async function main() {
     }
   }
 
-  const keyOf = (t: Transaction) => {
-    // For multi-order transactions, include orderIndex to ensure unique keys
-    const parts = [
-      t.orderId ?? "no-id",
-      t.amount ?? (t.totalAmount ?? "no-amount"),
-      t.date ?? "no-date"
-    ];
-    if (t.multiOrderTransaction && t.orderIndex !== undefined) {
-      parts.push(`idx-${t.orderIndex}`);
-    }
-    return parts.join("|");
-  };
-
-  // Build index of existing by key and scrub old login artefacts
-  // Also filter out old entries with malformed orderIds (ending with '-')
-  // Also filter out entries that are being replaced by multi-order transactions
-  const newMultiOrderIds = new Set<string>();
-  for (const t of transactions) {
-    if (t.multiOrderTransaction && t.orderId) {
-      newMultiOrderIds.add(t.orderId);
-    }
-  }
-  
-  const existingArr: Transaction[] = (existing?.transactions ?? []).filter(t => {
-    if (t.paymentInstrument === "Amazon Punkte Punkte" || t.paymentInstrument === "Santander-Punkte") {
-      return false;
-    }
-    // Filter out old entries with malformed orderIds (ending with '-')
-    if (t.orderId && t.orderId.endsWith('-')) {
-      return false;
-    }
-    // Filter out old single-order entries that are now part of multi-order transactions
-    if (t.orderId && !t.multiOrderTransaction && newMultiOrderIds.has(t.orderId)) {
-      console.log(`   [Merge] Removing old single-order entry for ${t.orderId} (now part of multi-order transaction)`);
-      return false;
-    }
-    return true;
-  });
+  const existingArr: Transaction[] = existing?.transactions ?? [];
   for (const et of existingArr) scrubLoginFields(et);
-  const existingByKey = new Map<string, Transaction>(existingArr.map((t) => [keyOf(t), t]));
-
-  // Update existing entries with fresh titles/descriptions from this run.
-  // If not present yet, collect as new entries.
-  const newOnes: Transaction[] = [];
   for (const t of transactions) {
     scrubLoginFields(t);
-    const k = keyOf(t);
-    const ex = existingByKey.get(k);
-    if (ex) {
-      // Prefer values from the current run if available
-      if (t.orderTitles !== undefined) ex.orderTitles = t.orderTitles ?? ex.orderTitles ?? null;
-      if (t.orderDescription !== undefined) ex.orderDescription = t.orderDescription ?? ex.orderDescription ?? null;
-      if (t.orderItems !== undefined) ex.orderItems = t.orderItems ?? ex.orderItems ?? null;
-      if (t.orderSummary !== undefined) ex.orderSummary = t.orderSummary ?? ex.orderSummary ?? null;
-      if (t.aiSummary !== undefined) ex.aiSummary = t.aiSummary ?? ex.aiSummary ?? null;
-      // Ensure no login artefacts remain after merge
-      scrubLoginFields(ex);
-    } else {
-      newOnes.push(t);
-      existingByKey.set(k, t);
-    }
   }
 
-  // Keep existing order (stable) and prepend new ones (like before)
-  const mergedTransactions = newOnes.concat(existingArr);
+  const mergeResult = mergeTransactions(existingArr, transactions);
+  const newOnes = mergeResult.newTransactions;
+  const mergedTransactions = mergeResult.transactions;
+  for (const transaction of mergedTransactions) scrubLoginFields(transaction);
 
   const mergedPayload: Persisted = {
     count: mergedTransactions.length,
@@ -1095,7 +1180,9 @@ async function main() {
     transactions: mergedTransactions
   };
 
-  fs.writeFileSync(path, JSON.stringify(mergedPayload, null, 2));
+  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(mergedPayload, null, 2), "utf8");
+  fs.renameSync(tempPath, path);
   console.log("[3/4] Schreiben abgeschlossen.");
 
   // Step 4: Summary
@@ -1124,15 +1211,19 @@ main().catch((e) => {
   console.error("=== AMAZON SCRAPING FEHLER ===");
   console.error("Error:", e.message || e);
   console.error("Error Type:", e.constructor?.name || 'Unknown');
-  console.error("Stack:", e.stack || 'No stack trace');
+  if (DEBUG_SCRAPER) {
+    console.error("Stack:", e.stack || 'No stack trace');
+  }
   
   // Environment debugging
-  console.error("=== ENVIRONMENT INFO ===");
-  console.error("Playwright version:", require('playwright').version || 'Unknown');
-  console.error("Node.js version:", process.version);
-  console.error("Platform:", process.platform);
-  console.error("HEADLESS mode:", HEADLESS);
-  console.error("Options:", cliOptions);
+  if (DEBUG_SCRAPER) {
+    console.error("=== ENVIRONMENT INFO ===");
+    console.error("Playwright version:", require('playwright').version || 'Unknown');
+    console.error("Node.js version:", process.version);
+    console.error("Platform:", process.platform);
+    console.error("HEADLESS mode:", HEADLESS);
+    console.error("Options:", cliOptions);
+  }
   
   // Common error scenarios and solutions
   if (e.message?.includes('Timeout') || e.message?.includes('timeout')) {

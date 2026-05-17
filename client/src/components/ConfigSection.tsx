@@ -1,22 +1,48 @@
 import { useState, useEffect, useRef } from 'react';
+import { ApiError, apiGet, apiPost } from '../api';
 
 interface ConfigSectionProps {
   onSyncComplete: () => void;
 }
 
+type SyncStatus = {
+  status: 'idle' | 'running' | 'success' | 'error';
+  logs: { line: string; stream: 'stdout' | 'stderr'; timestamp: number }[];
+  lastLog: { line: string; stream: 'stdout' | 'stderr'; timestamp: number } | null;
+  startedAt?: number;
+  finishedAt?: number;
+  error?: string | null;
+};
+
+type YnabConfig = {
+  configured: boolean;
+  missing: string[];
+};
+
+type LoginCheckStatus = {
+  valid: boolean;
+  message: string;
+  payments?: {
+    valid: boolean;
+    message: string;
+  };
+  details?: {
+    valid: boolean;
+    message: string;
+    orderId?: string | null;
+  };
+};
+
+type SyncMode = 'current-month' | 'newest' | 'last-n' | 'date-range';
+
 function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
-  const [loginStatus, setLoginStatus] = useState<{ valid: boolean; message: string } | null>(null);
+  const [loginStatus, setLoginStatus] = useState<LoginCheckStatus | null>(null);
+  const [ynabConfig, setYnabConfig] = useState<YnabConfig | null>(null);
   const [loading, setLoading] = useState<{ [key: string]: boolean }>({});
-  const [syncStatus, setSyncStatus] = useState<{
-    status: 'idle' | 'running' | 'success' | 'error';
-    logs: { line: string; stream: 'stdout' | 'stderr'; timestamp: number }[];
-    lastLog: { line: string; stream: 'stdout' | 'stderr'; timestamp: number } | null;
-    startedAt?: number;
-    finishedAt?: number;
-    error?: string | null;
-  } | null>(null);
+  const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const pollRef = useRef<number | null>(null);
-  const [syncMode, setSyncMode] = useState<'current-month' | 'last-n' | 'date-range'>('current-month');
+  const [syncMode, setSyncMode] = useState<SyncMode>('current-month');
   const [lastCount, setLastCount] = useState<number>(20);
   const [customRange, setCustomRange] = useState<{ start: string; end: string }>({ start: '', end: '' });
   const [syncValidationError, setSyncValidationError] = useState<string | null>(null);
@@ -24,6 +50,7 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
   const [progressNow, setProgressNow] = useState(() => Date.now());
   const runningEstimateRef = useRef<number | null>(null);
   const lastFinishedAtRef = useRef<number | null>(null);
+  const currentSyncStatus = syncStatus?.status;
 
   const formatDuration = (value: number | null | undefined) => {
     if (!Number.isFinite(value) || !value || value <= 0) return '0:00 min';
@@ -39,6 +66,9 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
   };
 
   const computeFallbackDuration = () => {
+    if (syncMode === 'newest') {
+      return 120000;
+    }
     if (syncMode === 'last-n') {
       const count = Number.isFinite(lastCount) && lastCount > 0 ? Math.floor(lastCount) : 20;
       const perItem = 11000; // empirische Schätzung pro Detailseite
@@ -67,15 +97,15 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
   }, []);
 
   useEffect(() => {
-    if (syncStatus?.status !== 'running') return;
+    if (currentSyncStatus !== 'running') return;
     const id = window.setInterval(() => setProgressNow(Date.now()), 500);
     return () => window.clearInterval(id);
-  }, [syncStatus?.status]);
+  }, [currentSyncStatus]);
 
   useEffect(() => {
-    if (syncStatus?.status === 'running') return;
+    if (currentSyncStatus === 'running') return;
     setProgressNow(Date.now());
-  }, [syncStatus?.status]);
+  }, [currentSyncStatus]);
 
   useEffect(() => {
     if (!syncStatus || syncStatus.status !== 'success') return;
@@ -94,15 +124,13 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
   }, [syncStatus]);
 
   useEffect(() => {
-    if (!syncStatus || syncStatus.status === 'running') return;
+    if (!currentSyncStatus || currentSyncStatus === 'running') return;
     runningEstimateRef.current = null;
-  }, [syncStatus?.status]);
+  }, [currentSyncStatus]);
 
   const fetchSyncStatus = async () => {
     try {
-      const response = await fetch('http://localhost:3001/api/sync-status');
-      if (!response.ok) return;
-      const data = await response.json();
+      const data = await apiGet<SyncStatus>('/api/sync-status');
       setSyncStatus(data);
       return data;
     } catch (error) {
@@ -128,29 +156,47 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
   const checkLogin = async () => {
     setLoading(prev => ({ ...prev, check: true }));
     try {
-      const response = await fetch('http://localhost:3001/api/check-login');
-      const data = await response.json();
+      const data = await apiGet<LoginCheckStatus>('/api/check-login');
       setLoginStatus(data);
     } catch (error) {
-      setLoginStatus({ valid: false, message: 'Fehler beim Prüfen des Login-Status' });
+      setLoginStatus({ valid: false, message: error instanceof ApiError ? error.message : 'Fehler beim Prüfen des Login-Status' });
     } finally {
       setLoading(prev => ({ ...prev, check: false }));
     }
   };
 
+  const checkYnabConfig = async () => {
+    setLoading(prev => ({ ...prev, ynabConfig: true }));
+    try {
+      const data = await apiGet<YnabConfig>('/api/ynab-config');
+      setYnabConfig(data);
+    } catch (error) {
+      setYnabConfig({ configured: false, missing: ['YNAB_TOKEN', 'YNAB_ACCOUNT_ID'] });
+      setNotice({
+        type: 'error',
+        message: error instanceof ApiError ? error.message : 'YNAB-Konfiguration konnte nicht geprüft werden.'
+      });
+    } finally {
+      setLoading(prev => ({ ...prev, ynabConfig: false }));
+    }
+  };
+
   const runLogin = async () => {
     setLoading(prev => ({ ...prev, login: true }));
+    setNotice(null);
     try {
-      const response = await fetch('http://localhost:3001/api/login', { method: 'POST' });
-      const data = await response.json();
+      const data = await apiPost<{ success: boolean; message?: string }>('/api/login');
       if (data.success) {
-        alert('Login erfolgreich! Bitte prüfen Sie den Browser.');
+        setNotice({ type: 'success', message: 'Login erfolgreich. Bitte prüfen Sie den Browser.' });
         checkLogin(); // Status aktualisieren
       } else {
-        alert(`Login fehlgeschlagen: ${data.message}`);
+        setNotice({ type: 'error', message: data.message || 'Login fehlgeschlagen.' });
       }
     } catch (error) {
-      alert('Fehler beim Ausführen des Logins');
+      setNotice({
+        type: 'error',
+        message: error instanceof ApiError ? error.message : 'Fehler beim Ausführen des Logins'
+      });
     } finally {
       setLoading(prev => ({ ...prev, login: false }));
     }
@@ -158,6 +204,7 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
 
   const runSync = async () => {
     setSyncValidationError(null);
+    setNotice(null);
     try {
       const payload: Record<string, unknown> = { mode: syncMode };
 
@@ -193,14 +240,9 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
       setLoading(prev => ({ ...prev, sync: true }));
       startPolling();
 
-      const response = await fetch('http://localhost:3001/api/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      const data = await response.json();
+      const data = await apiPost<{ success: boolean; message?: string; output?: string; stderr?: string }>('/api/sync', payload);
       if (data.success) {
-        alert('Sync erfolgreich!');
+        setNotice({ type: 'success', message: 'Sync erfolgreich abgeschlossen.' });
         if (data.output) {
           console.log('[Sync] STDOUT:\n', data.output);
         }
@@ -209,6 +251,7 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
         }
         onSyncComplete();
       } else {
+        setNotice({ type: 'error', message: data.message || 'Sync fehlgeschlagen.' });
         console.error('Sync fehlgeschlagen:', data.message);
         if (data.output) {
           console.error('[Sync] STDOUT:\n', data.output);
@@ -220,6 +263,10 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
       await fetchSyncStatus();
     } catch (error) {
       console.error('Fehler beim Ausführen des Syncs', error);
+      setNotice({
+        type: 'error',
+        message: error instanceof ApiError ? error.message : 'Fehler beim Ausführen des Syncs'
+      });
     } finally {
       setLoading(prev => ({ ...prev, sync: false }));
       stopPolling();
@@ -228,6 +275,7 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
 
   useEffect(() => {
     checkLogin();
+    checkYnabConfig();
     fetchSyncStatus();
 
     return () => {
@@ -319,6 +367,12 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
 
       </div>
 
+      {notice && (
+        <div className={`inline-notice notice-${notice.type}`} role={notice.type === 'error' ? 'alert' : 'status'}>
+          {notice.message}
+        </div>
+      )}
+
       <div className="config-item">
         <h3>Amazon Login Status</h3>
         <div className="status-display" aria-live="polite">
@@ -330,6 +384,24 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
             <span>Prüfe...</span>
           )}
         </div>
+        {loginStatus && (
+          <div className="session-checks">
+            <div className={loginStatus.payments?.valid ? 'session-check ok' : 'session-check warn'}>
+              <span>Zahlungsübersicht</span>
+              <strong>{loginStatus.payments?.message ?? 'Nicht geprüft'}</strong>
+            </div>
+            <div className={loginStatus.details?.valid ? 'session-check ok' : 'session-check warn'}>
+              <span>Bestelldetails</span>
+              <strong>{loginStatus.details?.message ?? 'Nicht geprüft'}</strong>
+              {loginStatus.details?.orderId && <small>Test-Order: {loginStatus.details.orderId}</small>}
+            </div>
+          </div>
+        )}
+        {loginStatus?.payments?.valid && loginStatus.details && !loginStatus.details.valid && (
+          <p className="config-hint">
+            Amazon lässt die Zahlungsübersicht zu, verlangt für Bestelldetails aber Reauth. Starten Sie den Login erneut.
+          </p>
+        )}
         <div className="button-group">
           <button
             onClick={checkLogin}
@@ -349,10 +421,37 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
       </div>
 
       <div className="config-item">
+        <h3>YNAB Konfiguration</h3>
+        <div className="status-display" aria-live="polite">
+          {ynabConfig ? (
+            <span className={ynabConfig.configured ? 'status-valid' : 'status-invalid'}>
+              {ynabConfig.configured
+                ? 'YNAB ist konfiguriert'
+                : `Fehlt: ${ynabConfig.missing.join(', ')}`}
+            </span>
+          ) : (
+            <span>Prüfe...</span>
+          )}
+        </div>
+        {!ynabConfig?.configured && ynabConfig && (
+          <p className="config-hint">
+            Ergänzen Sie die fehlenden Werte in der .env Datei und starten Sie den Server neu.
+          </p>
+        )}
+        <button
+          onClick={checkYnabConfig}
+          disabled={loading.ynabConfig}
+          className="btn-secondary"
+        >
+          {loading.ynabConfig ? 'Prüfe...' : 'YNAB prüfen'}
+        </button>
+      </div>
+
+      <div className="config-item">
         <h3>Amazon Transaktionen Sync</h3>
 
         <div className="timeframe-controls">
-          <label>
+          <label className={`sync-option option-current ${syncMode === 'current-month' ? 'active' : ''}`}>
             <input
               type="radio"
               name="sync-mode"
@@ -363,9 +462,25 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
                 setSyncValidationError(null);
               }}
             />
-            Aktueller Monat
+            <span className="option-text">Aktueller Monat</span>
           </label>
-          <label className={`option-last ${syncMode === 'last-n' ? 'active' : ''}`}>
+          <label className={`sync-option option-newest ${syncMode === 'newest' ? 'active' : ''}`}>
+            <input
+              type="radio"
+              name="sync-mode"
+              value="newest"
+              checked={syncMode === 'newest'}
+              onChange={() => {
+                setSyncMode('newest');
+                setSyncValidationError(null);
+              }}
+            />
+            <span className="option-text">
+              Neuste Einträge
+              <span className="option-help">Alles seit der letzten erfolgreichen YNAB-Synchronisierung</span>
+            </span>
+          </label>
+          <label className={`sync-option option-last ${syncMode === 'last-n' ? 'active' : ''}`}>
             <input
               type="radio"
               name="sync-mode"
@@ -376,20 +491,22 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
                 setSyncValidationError(null);
               }}
             />
-            Letzte
-            <input
-              type="number"
-              min={1}
-              value={lastCount}
-              onChange={(e) => {
-                setLastCount(Number(e.target.value));
-                setSyncValidationError(null);
-              }}
-              disabled={syncMode !== 'last-n'}
-            />
-            Einträge
+            <span className="option-text">
+              Letzte
+              <input
+                type="number"
+                min={1}
+                value={lastCount}
+                onChange={(e) => {
+                  setLastCount(Number(e.target.value));
+                  setSyncValidationError(null);
+                }}
+                disabled={syncMode !== 'last-n'}
+              />
+              Einträge
+            </span>
           </label>
-          <label className={`option-range ${syncMode === 'date-range' ? 'active' : ''}`}>
+          <label className={`sync-option option-range ${syncMode === 'date-range' ? 'active' : ''}`}>
             <input
               type="radio"
               name="sync-mode"
@@ -400,7 +517,7 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
                 setSyncValidationError(null);
               }}
             />
-            Zeitraum
+            <span className="option-text">Zeitraum</span>
           </label>
           {syncMode === 'date-range' && (
             <div className="date-range-inputs">

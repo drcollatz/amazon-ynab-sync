@@ -57,13 +57,13 @@ npm run dev
 ```
 
 The application will be available at:
-- **Web Interface**: http://localhost:3001
+- **Web Interface (Vite)**: http://localhost:5173
 - **API Server**: http://localhost:3001/api/*
 
 ## 📋 Usage
 
 ### Web Interface
-1. Open http://localhost:3001 in your browser
+1. Open http://localhost:5173 in your browser
 2. Check Amazon login status
 3. Select desired sync time period
 4. Start synchronization
@@ -74,6 +74,9 @@ The application will be available at:
 ```bash
 # Sync current month
 npm run sync
+
+# Sync visible entries since the last YNAB-synced transaction in transactions.json
+npx ts-node transactions-to-json.ts --mode newest
 
 # Sync last 50 transactions
 npx ts-node transactions-to-json.ts --mode last-n --last 50
@@ -89,6 +92,7 @@ npm run ynab
 
 ### Sync Modes
 - **current-month**: Current month (default)
+- **newest**: Latest visible Amazon entries since the first transaction already marked as YNAB-synced in `transactions.json`
 - **last-n**: Last N transactions
 - **date-range**: Specific date range
 
@@ -99,7 +103,16 @@ YNAB_BUDGET_ID=last-used
 YNAB_ACCOUNT_ID=your_account_id
 OPENAI_API_KEY=your_openai_key
 DRY_RUN=0  # 1 for test mode without YNAB sync
+PORT=3001
+HOST=127.0.0.1
+CORS_ORIGIN=http://localhost:5173,http://127.0.0.1:5173
+# Optional API protection:
+# API_AUTH_TOKEN=generate_a_long_random_token
 ```
+
+If you enable `API_AUTH_TOKEN`, create `client/.env.local` and set
+`VITE_API_AUTH_TOKEN` to the same value. You can also override the API URL with
+`VITE_API_BASE_URL`.
 
 ## 🏗️ Architecture
 
@@ -112,8 +125,19 @@ DRY_RUN=0  # 1 for test mode without YNAB sync
 ## 🔒 Security
 
 - Browser session data is stored locally
-- CORS is restricted to localhost
-- No sensitive data in logs
+- The API binds to `127.0.0.1` by default
+- CORS is restricted to configured localhost origins
+- Optional API-key protection is available via `API_AUTH_TOKEN`
+- Raw script output is not returned to the browser unless `API_DEBUG_OUTPUT=1`
+- Debug-heavy scraper logs are disabled unless `DEBUG_SCRAPER=1`
+
+## ✅ Quality Checks
+
+```bash
+npm run typecheck
+npm test
+cd client && npm run lint && npm run build
+```
 
 ## 🐛 Troubleshooting
 
@@ -121,6 +145,7 @@ DRY_RUN=0  # 1 for test mode without YNAB sync
 - Make sure you've run `npm run login`
 - Check if `amazon.storageState.json` exists
 - Try the login process again
+- The app checks payments and order details separately. If payments work but order details need reauth, run `npm run login` again so older order detail pages can be opened.
 
 ### YNAB Sync Failing
 - Check your YNAB API keys in the `.env` file

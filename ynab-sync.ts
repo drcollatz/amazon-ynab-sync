@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import https from "https";
+import { amountToMilliunits, parseGermanDateToISO, parseIdList } from "./ynab-utils";
 
 const YNAB_TOKEN = process.env.YNAB_TOKEN;
 const YNAB_BUDGET_ID = process.env.YNAB_BUDGET_ID || "last-used"; // "last-used" ist erlaubt
@@ -8,6 +9,9 @@ const YNAB_ACCOUNT_ID = process.env.YNAB_ACCOUNT_ID;
 
 const INPUT_FILE = path.resolve("transactions.json");
 const DRY_RUN = process.env.DRY_RUN === "1";
+const DEBUG_SYNC = process.env.DEBUG_SYNC === "1";
+const YNAB_HTTP_TIMEOUT_MS = Number(process.env.YNAB_HTTP_TIMEOUT_MS || 15000);
+const MAX_YNAB_ERROR_BODY_LENGTH = 1000;
 
 if (!YNAB_TOKEN || !YNAB_ACCOUNT_ID) {
   console.error("Bitte YNAB_TOKEN und YNAB_ACCOUNT_ID als ENV setzen.");
@@ -15,6 +19,36 @@ if (!YNAB_TOKEN || !YNAB_ACCOUNT_ID) {
 }
 
 const SUMMARY_SAMPLE_LIMIT = 5;
+
+function redact(value: string): string {
+  const secrets = [YNAB_TOKEN, YNAB_ACCOUNT_ID].filter((secret): secret is string => Boolean(secret));
+  let redacted = value;
+  for (const secret of secrets) {
+    redacted = redacted.split(secret).join("[redacted]");
+  }
+  return redacted.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]");
+}
+
+function compactErrorBody(body: string): string {
+  const trimmed = redact(body.replace(/\s+/g, " ").trim());
+  if (trimmed.length <= MAX_YNAB_ERROR_BODY_LENGTH) return trimmed;
+  return `${trimmed.slice(0, MAX_YNAB_ERROR_BODY_LENGTH).trimEnd()}...`;
+}
+
+function writeJsonAtomicSync(filePath: string, data: unknown): void {
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), "utf8");
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+      // best effort cleanup
+    }
+    throw error;
+  }
+}
 
 type FilterEntry = { count: number; examples: string[] };
 type SelectionStatus =
@@ -120,22 +154,6 @@ type YnabSyncPayload = {
   import_id: string;
 };
 
-const deMonths: Record<string, string> = {
-  januar: "01",
-  februar: "02",
-  märz: "03",
-  maerz: "03",
-  april: "04",
-  mai: "05",
-  juni: "06",
-  juli: "07",
-  august: "08",
-  september: "09",
-  oktober: "10",
-  november: "11",
-  dezember: "12",
-};
-
 function makeFilterEntry(): FilterEntry {
   return { count: 0, examples: [] };
 }
@@ -149,24 +167,6 @@ function recordFilter(entry: FilterEntry, sample?: string | null) {
 
 function normalizeId(id: string): string {
   return id.trim();
-}
-
-function parseIdList(raw: string | undefined): string[] {
-  if (!raw) return [];
-  const value = raw.trim();
-  if (!value) return [];
-  try {
-    const parsed = JSON.parse(value);
-    if (Array.isArray(parsed)) {
-      return parsed.map((item) => (typeof item === "string" ? item : String(item)));
-    }
-  } catch {
-    // ignore invalid JSON, fall back to comma-separated parsing
-  }
-  return value
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean);
 }
 
 function parseCliOrderIds(argv: string[]): string[] {
@@ -250,53 +250,6 @@ function logInfo(message: string, data?: unknown) {
   }
 }
 
-function parseGermanDateToISO(d: string): string | null {
-  const m = d.trim().toLowerCase().match(/^(\d{1,2})\.\s*([a-zäöüß]+)\s+(\d{4})$/i);
-  if (!m) return null;
-  const day = m[1].padStart(2, "0");
-  const monKey = m[2]
-    .normalize("NFD")
-    .replace(/\p{Diacritic}/gu, "")
-    .replace("marz", "maerz");
-  const month = deMonths[monKey] || deMonths[m[2]];
-  if (!month) return null;
-  return `${m[3]}-${month}-${day}`;
-}
-
-function amountToMilliunits(amountStr: string | null | undefined, isRefundFlag: boolean): number {
-  if (!amountStr) return 0;
-  const isPositive = amountStr.includes("+") || isRefundFlag;
-  const sign = isPositive ? 1 : -1;
-
-  // Handle both German (€,) and English (€.) format
-  const cleanAmount = amountStr.replace(/[^\d,.]/g, "");
-  let numeric: number;
-
-  if (cleanAmount.includes(",") && !cleanAmount.includes(".")) {
-    // German format: "19,94" -> "19.94"
-    numeric = parseFloat(cleanAmount.replace(",", "."));
-  } else if (cleanAmount.includes(".") && !cleanAmount.includes(",")) {
-    // English format: "19.94" -> 19.94
-    numeric = parseFloat(cleanAmount);
-  } else if (cleanAmount.includes(",") && cleanAmount.includes(".")) {
-    // Both present - assume last occurrence is decimal separator
-    const lastComma = cleanAmount.lastIndexOf(",");
-    const lastDot = cleanAmount.lastIndexOf(".");
-    if (lastComma > lastDot) {
-      // German format with thousands separator: "1.234,56" -> "1234.56"
-      numeric = parseFloat(cleanAmount.replace(/\./g, "").replace(",", "."));
-    } else {
-      // English format with thousands separator: "1,234.56" -> "1234.56"
-      numeric = parseFloat(cleanAmount.replace(/,/g, ""));
-    }
-  } else {
-    // No separators, just digits
-    numeric = parseFloat(cleanAmount);
-  }
-
-  return Math.round(sign * numeric * 1000);
-}
-
 async function httpPostJSON(url: string, body: any, token: string): Promise<YnabResponse> {
   return new Promise((resolve, reject) => {
     const { hostname, pathname, search } = new URL(url);
@@ -314,6 +267,9 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<Ynab
       let data = "";
       res.on("data", (chunk) => {
         data += chunk;
+        if (res.statusCode && res.statusCode >= 300 && data.length > MAX_YNAB_ERROR_BODY_LENGTH * 4) {
+          req.destroy(new Error("YNAB response body too large"));
+        }
       });
       res.on("end", () => {
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
@@ -323,9 +279,12 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<Ynab
             resolve({});
           }
         } else {
-          reject(new Error(`YNAB HTTP ${res.statusCode}: ${data}`));
+          reject(new Error(`YNAB HTTP ${res.statusCode}: ${compactErrorBody(data || res.statusMessage || "")}`));
         }
       });
+    });
+    req.setTimeout(YNAB_HTTP_TIMEOUT_MS, () => {
+      req.destroy(new Error(`YNAB request timed out after ${YNAB_HTTP_TIMEOUT_MS}ms`));
     });
     req.on("error", reject);
     req.write(JSON.stringify(body));
@@ -808,7 +767,7 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<Ynab
 
     summary.response.missingImportIds = missingImportIds;
 
-    fs.writeFileSync(INPUT_FILE, JSON.stringify(parsed, null, 2), "utf8");
+    writeJsonAtomicSync(INPUT_FILE, parsed);
     logInfo(`Sync erfolgreich, Datei aktualisiert (${INPUT_FILE}).`);
 
     summary.selection = buildSelectionSummary(selectionStatusMap);
@@ -816,18 +775,19 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<Ynab
     console.log(`✅ Sync fertig. Datei aktualisiert: ${INPUT_FILE}`);
   } catch (error: any) {
     const message = error?.message || String(error);
-    const stack = error?.stack || 'No stack trace available';
 
     // Enhanced error logging for better debugging
     console.error("=== YNAB SYNC FEHLER ===");
-    console.error("Error Message:", message);
+    console.error("Error Message:", redact(message));
     console.error("Error Type:", error?.constructor?.name || 'Unknown');
-    console.error("Stack Trace:", stack);
+    if (DEBUG_SYNC) {
+      console.error("Stack Trace:", redact(error?.stack || 'No stack trace available'));
+    }
 
     // Log environment information for debugging
     console.error("=== ENVIRONMENT ===");
     console.error("YNAB_TOKEN exists:", !!YNAB_TOKEN);
-    console.error("YNAB_BUDGET_ID:", YNAB_BUDGET_ID);
+    console.error("YNAB_BUDGET_ID configured:", !!YNAB_BUDGET_ID);
     console.error("YNAB_ACCOUNT_ID exists:", !!YNAB_ACCOUNT_ID);
     console.error("INPUT_FILE:", INPUT_FILE);
     console.error("File exists:", require('fs').existsSync(INPUT_FILE));
@@ -860,7 +820,7 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<Ynab
       console.error("3. Insufficient file permissions");
     }
 
-    summary.response.error = message;
+    summary.response.error = redact(message);
     console.error("=== SYNC SUMMARY AT ERROR ===");
     summary.selection = buildSelectionSummary(selectionStatusMap);
     console.log(`[YNAB][SUMMARY] ${JSON.stringify(summary, null, 2)}`);
