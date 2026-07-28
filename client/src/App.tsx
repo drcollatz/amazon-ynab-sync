@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import './App.css';
 import ConfigSection from './components/ConfigSection';
 import TransactionList from './components/TransactionList';
@@ -34,6 +34,7 @@ export interface Transaction {
     ynabTransactionId?: string | null;
     duplicateImportId?: boolean;
     amountMilliunits?: number | null;
+    manuallyMarked?: boolean;
   } | null;
 }
 
@@ -42,7 +43,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  const fetchTransactions = async () => {
+  const fetchTransactions = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
     try {
@@ -54,11 +55,14 @@ function App() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchTransactions();
-  }, []);
+    const timeoutId = window.setTimeout(() => {
+      void fetchTransactions();
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
+  }, [fetchTransactions]);
 
   const summary = useMemo(() => {
     const total = transactions.length;

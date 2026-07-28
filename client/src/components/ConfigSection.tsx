@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { ApiError, apiGet, apiPost } from '../api';
 
 interface ConfigSectionProps {
@@ -46,9 +46,14 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
   const [lastCount, setLastCount] = useState<number>(20);
   const [customRange, setCustomRange] = useState<{ start: string; end: string }>({ start: '', end: '' });
   const [syncValidationError, setSyncValidationError] = useState<string | null>(null);
-  const [estimatedDurationMs, setEstimatedDurationMs] = useState<number | null>(null);
+  const [estimatedDurationMs, setEstimatedDurationMs] = useState<number | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const stored = window.localStorage.getItem('sync-average-duration');
+    const parsed = Number(stored);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  });
   const [progressNow, setProgressNow] = useState(() => Date.now());
-  const runningEstimateRef = useRef<number | null>(null);
+  const [runningEstimateMs, setRunningEstimateMs] = useState<number | null>(null);
   const lastFinishedAtRef = useRef<number | null>(null);
   const currentSyncStatus = syncStatus?.status;
 
@@ -87,32 +92,17 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
   };
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const stored = window.localStorage.getItem('sync-average-duration');
-    if (!stored) return;
-    const parsed = Number(stored);
-    if (Number.isFinite(parsed) && parsed > 0) {
-      setEstimatedDurationMs(parsed);
-    }
-  }, []);
-
-  useEffect(() => {
     if (currentSyncStatus !== 'running') return;
     const id = window.setInterval(() => setProgressNow(Date.now()), 500);
     return () => window.clearInterval(id);
   }, [currentSyncStatus]);
 
-  useEffect(() => {
-    if (currentSyncStatus === 'running') return;
-    setProgressNow(Date.now());
-  }, [currentSyncStatus]);
-
-  useEffect(() => {
-    if (!syncStatus || syncStatus.status !== 'success') return;
-    if (typeof syncStatus.startedAt !== 'number' || typeof syncStatus.finishedAt !== 'number') return;
-    if (syncStatus.finishedAt === lastFinishedAtRef.current) return;
-    lastFinishedAtRef.current = syncStatus.finishedAt;
-    const duration = syncStatus.finishedAt - syncStatus.startedAt;
+  const recordSyncDuration = useCallback((status: SyncStatus) => {
+    if (status.status !== 'success') return;
+    if (typeof status.startedAt !== 'number' || typeof status.finishedAt !== 'number') return;
+    if (status.finishedAt === lastFinishedAtRef.current) return;
+    lastFinishedAtRef.current = status.finishedAt;
+    const duration = status.finishedAt - status.startedAt;
     if (!Number.isFinite(duration) || duration <= 0) return;
     setEstimatedDurationMs(prev => {
       const next = prev ? Math.round(prev * 0.5 + duration * 0.5) : duration;
@@ -121,22 +111,18 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
       }
       return next;
     });
-  }, [syncStatus]);
+  }, []);
 
-  useEffect(() => {
-    if (!currentSyncStatus || currentSyncStatus === 'running') return;
-    runningEstimateRef.current = null;
-  }, [currentSyncStatus]);
-
-  const fetchSyncStatus = async () => {
+  const fetchSyncStatus = useCallback(async () => {
     try {
       const data = await apiGet<SyncStatus>('/api/sync-status');
       setSyncStatus(data);
+      recordSyncDuration(data);
       return data;
     } catch (error) {
       console.error('Sync-Status konnte nicht geladen werden', error);
     }
-  };
+  }, [recordSyncDuration]);
 
   const startPolling = () => {
     fetchSyncStatus();
@@ -235,7 +221,7 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
         payload.endDate = customRange.end;
       }
 
-      runningEstimateRef.current = Math.max(60000, estimatedDurationMs ?? computeFallbackDuration());
+      setRunningEstimateMs(Math.max(60000, estimatedDurationMs ?? computeFallbackDuration()));
 
       setLoading(prev => ({ ...prev, sync: true }));
       startPolling();
@@ -274,22 +260,25 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
   };
 
   useEffect(() => {
-    checkLogin();
-    checkYnabConfig();
-    fetchSyncStatus();
+    const timeoutId = window.setTimeout(() => {
+      void checkLogin();
+      void checkYnabConfig();
+      void fetchSyncStatus();
+    }, 0);
 
     return () => {
+      window.clearTimeout(timeoutId);
       stopPolling();
     };
-  }, []);
+  }, [fetchSyncStatus]);
 
   const renderSyncInfo = () => {
     if (!syncStatus) return null;
     const { status, error, lastLog, startedAt, finishedAt } = syncStatus;
 
     if (status === 'running') {
-      const baseline = Math.max(60000, runningEstimateRef.current ?? estimatedDurationMs ?? computeFallbackDuration());
-      const start = typeof startedAt === 'number' ? startedAt : Date.now();
+      const baseline = Math.max(60000, runningEstimateMs ?? estimatedDurationMs ?? computeFallbackDuration());
+      const start = typeof startedAt === 'number' ? startedAt : progressNow;
       const elapsed = Math.max(0, progressNow - start);
       const target = Math.max(baseline, elapsed + 1000);
       const ratio = target > 0 ? Math.min(1, elapsed / target) : 0;
@@ -297,7 +286,7 @@ function ConfigSection({ onSyncComplete }: ConfigSectionProps) {
       const displayPercent = Math.min(100, Math.round(ratio * 100));
       const remaining = Math.max(0, target - elapsed);
       const etaTime = remaining > 60000
-        ? new Date(Date.now() + remaining).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
+        ? new Date(progressNow + remaining).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
         : null;
       const hintText = estimatedDurationMs
         ? `Schätzung basierend auf der letzten Laufzeit (${formatDuration(estimatedDurationMs)}).`

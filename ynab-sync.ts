@@ -124,6 +124,7 @@ type ParsedTransaction = {
     ynabTransactionId?: string | null;
     duplicateImportId?: boolean;
     amountMilliunits?: number;
+    manuallyMarked?: boolean;
   } | null;
   orderSummary?: {
     total?: string | null;
@@ -416,7 +417,10 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<Ynab
 
       summary.totals.withValidDate += 1;
 
-      const completedYnabSync = Boolean(transaction.ynabSynced && (transaction.ynabSync as any)?.ynabTransactionId);
+      const completedYnabSync = Boolean(
+        transaction.ynabSynced &&
+        ((transaction.ynabSync as any)?.ynabTransactionId || (transaction.ynabSync as any)?.manuallyMarked)
+      );
       if (completedYnabSync) {
         recordFilter(summary.filters.alreadySynced, sampleId);
         if (orderId && selectionStatusMap?.has(orderId)) {
@@ -427,7 +431,11 @@ async function httpPostJSON(url: string, body: any, token: string): Promise<Ynab
 
       summary.totals.eligibleBeforeSelection += 1;
 
-      if (transaction.ynabSynced && !(transaction.ynabSync as any)?.ynabTransactionId) {
+      if (
+        transaction.ynabSynced &&
+        !(transaction.ynabSync as any)?.ynabTransactionId &&
+        !(transaction.ynabSync as any)?.manuallyMarked
+      ) {
         recordFilter(summary.flags.ynabSyncedWithoutId, sampleId);
       }
 

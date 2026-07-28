@@ -52,11 +52,15 @@ export async function apiRequest<T>(path: string, options: ApiOptions = {}): Pro
   }
 
   const text = await response.text();
-  let data: unknown = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = { error: text || 'Ungültige API-Antwort.' };
+  let data: unknown;
+  if (!text) {
+    data = null;
+  } else {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { error: text || 'Ungültige API-Antwort.' };
+    }
   }
 
   if (!response.ok) {

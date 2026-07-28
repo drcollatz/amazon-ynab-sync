@@ -5,6 +5,7 @@ import { spawn, execSync } from 'child_process';
 import { promises as fs } from 'fs';
 import path from 'path';
 import OpenAI from 'openai';
+import { chromium } from 'playwright';
 import type { NextFunction, Request, Response } from 'express';
 
 const app = express();
@@ -33,20 +34,12 @@ const TRANSACTIONS_FILE = path.join(process.cwd(), 'transactions.json');
 // Check if Playwright is properly installed
 async function checkPlaywrightInstallation(): Promise<void> {
   try {
-    // Try to get Playwright executable path
     const result = execSync('npx playwright --version', { encoding: 'utf8' });
     console.log('✅ Playwright gefunden:', result.trim());
-    
-    // Check if chromium is installed
+
     try {
-      const chromiumCheck = execSync('npx playwright install --dry-run chromium 2>&1', { encoding: 'utf8' });
-      if (chromiumCheck.includes('is already installed')) {
-        console.log('✅ Chromium Browser ist installiert');
-      } else {
-        console.warn('⚠️  Chromium Browser fehlt. Installiere...');
-        execSync('npx playwright install chromium', { stdio: 'inherit' });
-        console.log('✅ Chromium Browser erfolgreich installiert');
-      }
+      await fs.access(chromium.executablePath());
+      console.log('✅ Chromium Browser ist installiert');
     } catch (error) {
       console.warn('⚠️  Chromium Browser wird installiert...');
       execSync('npx playwright install chromium', { stdio: 'inherit' });
@@ -241,6 +234,7 @@ interface Transaction {
     ynabTransactionId?: string | null;
     duplicateImportId?: boolean;
     amountMilliunits?: number | null;
+    manuallyMarked?: boolean;
   } | null;
 }
 
